@@ -20,11 +20,11 @@ if exist ".venv\Scripts\activate.bat" (
 
 rem -------- Configuration --------
 rem Set this to your Stooq download path if you want auto refresh
-set "STOOQ_SRC="
-set "DATA_DEST=%PROJECT_DIR%data"
+set "STOOQ_SRC=/Users/v/Downloads/data"
+set "DATA_DEST=%PROJECT_DIR%data 2"
 set "TICKERS_FILE=%PROJECT_DIR%nyse_tickers.csv"
 set "RESULTS_FILE=%PROJECT_DIR%results.csv"
-set "ROOT_DATA=%PROJECT_DIR%data\daily\us"
+set "ROOT_DATA=%PROJECT_DIR%data 2\daily\us"
 set "BENCHMARK=SPY.US"
 
 rem -------- Daily Steps --------
@@ -38,7 +38,7 @@ if exist "requirements.txt" (
     %PYTHON_CMD% -m pip install -r "requirements.txt"
 )
 
-%PYTHON_CMD% generate_tickers.py --out "%TICKERS_FILE%"
+%PYTHON_CMD% generate_tickers.py --dir "%ROOT_DATA%\nyse stocks" --out "%TICKERS_FILE%"
 
 %PYTHON_CMD% screen_stooq.py --tickers "%TICKERS_FILE%" --root "%ROOT_DATA%" --benchmark "%BENCHMARK%" --out "%RESULTS_FILE%"
 

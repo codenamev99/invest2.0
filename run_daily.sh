@@ -20,11 +20,11 @@ fi
 
 # -------- Configuration --------
 # Set this to your Stooq download path if you want auto refresh
-STOOQ_SRC=""
-DATA_DEST="$PROJECT_DIR/data"
+STOOQ_SRC="/Users/v/Downloads/data"
+DATA_DEST="$PROJECT_DIR/data 2"
 TICKERS_FILE="$PROJECT_DIR/nyse_tickers.csv"
 RESULTS_FILE="$PROJECT_DIR/results.csv"
-ROOT_DATA="$PROJECT_DIR/data/daily/us"
+ROOT_DATA="$PROJECT_DIR/data 2/daily/us"
 BENCHMARK="SPY.US"
 
 # -------- Daily Steps --------
@@ -38,7 +38,7 @@ if [ -f "requirements.txt" ]; then
   $PYTHON_CMD -m pip install -r "requirements.txt"
 fi
 
-$PYTHON_CMD generate_tickers.py --out "$TICKERS_FILE"
+$PYTHON_CMD generate_tickers.py --dir "$ROOT_DATA/nyse stocks" --out "$TICKERS_FILE"
 
 $PYTHON_CMD screen_stooq.py --tickers "$TICKERS_FILE" --root "$ROOT_DATA" --benchmark "$BENCHMARK" --out "$RESULTS_FILE"
 
