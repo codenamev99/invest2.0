@@ -5,5 +5,6 @@
 __pycache__/
 *.pyc
 data/
+data [0-9]*/
 results.csv
 nyse_tickers.csv
