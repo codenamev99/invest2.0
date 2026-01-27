@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import calendar
 import csv
 import os
+from datetime import date
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 
 
 # -----------------------------
@@ -191,6 +196,34 @@ def month_key(date_int: int) -> int:
     return (date_int // 10000) * 100 + (date_int // 100) % 100
 
 
+def date_from_int(date_int: int) -> date:
+    """
+    Convert YYYYMMDD int to date.
+    """
+    year = date_int // 10000
+    month = (date_int // 100) % 100
+    day = date_int % 100
+    return date(year, month, day)
+
+
+def date_to_int(d: date) -> int:
+    """
+    Convert date to YYYYMMDD int.
+    """
+    return d.year * 10000 + d.month * 100 + d.day
+
+
+def shift_months(d: date, months: int) -> date:
+    """
+    Shift date by N months, clamping the day if needed.
+    """
+    year = d.year + (d.month - 1 + months) // 12
+    month = (d.month - 1 + months) % 12 + 1
+    last_day = calendar.monthrange(year, month)[1]
+    day = min(d.day, last_day)
+    return date(year, month, day)
+
+
 def monthly_closes(dates: np.ndarray, closes: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """
     Reduce daily series to month-end closes.
@@ -313,6 +346,53 @@ def fmt2(x: Any) -> str:
         return str(x)
 
 
+def unique_sheet_name(wb: Workbook, base: str) -> str:
+    """
+    Return a unique worksheet name (<= 31 chars) for the workbook.
+    """
+    base = base.strip()[:31] or "Results"
+    if base not in wb.sheetnames:
+        return base
+
+    idx = 2
+    while True:
+        suffix = f" ({idx})"
+        trimmed = base[: 31 - len(suffix)]
+        name = f"{trimmed}{suffix}"
+        if name not in wb.sheetnames:
+            return name
+        idx += 1
+
+
+def is_empty_sheet(ws) -> bool:
+    """
+    Returns True if the worksheet has no values.
+    """
+    return ws.max_row == 1 and ws.max_column == 1 and ws["A1"].value is None
+
+
+def auto_size_columns(ws, min_width: int = 8, max_width: int = 40) -> None:
+    """
+    Auto-size worksheet column widths based on cell contents.
+    """
+    for col_idx, col_cells in enumerate(ws.iter_cols(min_col=1, max_col=ws.max_column), start=1):
+        max_len = 0
+        for cell in col_cells:
+            if cell.value is None:
+                continue
+            value_str = str(cell.value)
+            if "\n" in value_str:
+                value_len = max(len(line) for line in value_str.splitlines())
+            else:
+                value_len = len(value_str)
+            if value_len > max_len:
+                max_len = value_len
+        if max_len == 0:
+            continue
+        width = min(max_width, max(min_width, max_len + 2))
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+
 _WORKER_PARAMS: dict[str, Any] = {}
 _BENCH_MAP: dict[int, float] = {}
 _NEED_ROWS = 0
@@ -333,14 +413,28 @@ def screen_symbol(
     need_rows: int,
 ) -> dict[str, Any] | None:
     d, c, v = load_series_from_file(path, need_rows=need_rows)
-    if len(d) < max(params["avg_vol_days"] + 1, 60):
+    min_rows = 60
+    if params["avg_vol_mode"] == "days":
+        min_rows = max(params["avg_vol_days"] + 1, min_rows)
+    if len(d) < min_rows:
         return None
 
-    # Average daily $ volume filter (close * volume) over avg_vol_days
-    close_window = c[-params["avg_vol_days"]:]
-    vol_window = v[-params["avg_vol_days"]:]
+    # Average daily $ volume filter (close * volume) over avg volume window
+    if params["avg_vol_mode"] == "months":
+        last_date = date_from_int(int(d[-1]))
+        cutoff_date = shift_months(last_date, -int(params["avg_vol_months"]))
+        cutoff_int = date_to_int(cutoff_date)
+        if d[0] > cutoff_int:
+            return None
+        mask = d >= cutoff_int
+        if not np.any(mask):
+            return None
+        close_window = c[mask]
+        vol_window = v[mask]
+    else:
+        close_window = c[-params["avg_vol_days"]:]
+        vol_window = v[-params["avg_vol_days"]:]
 
-    avg_volume = float(np.mean(vol_window))
     avg_dollar_volume = float(np.mean(close_window * vol_window))
     if avg_dollar_volume <= params["avg_dollar_vol_min"]:
         return None
@@ -407,7 +501,6 @@ def screen_symbol(
         "rsi": last_rsi,
         "macd": last_macd,
         "signal": last_sig,
-        "avg_volume": avg_volume,
         "avg_dollar_volume": avg_dollar_volume,
     }
 
@@ -429,7 +522,11 @@ def main() -> None:
         help='Directory containing *.us.txt files to screen (e.g. "${workspaceFolder}/data/daily/us/nyse stocks")',
     )
     ap.add_argument("--root", required=True, help='Root folder: e.g. "${workspaceFolder}/data/daily/us" or "/Users/v/Downloads/data/daily/us"')
-    ap.add_argument("--out", default="results.csv", help='Output CSV path (supports ${workspaceFolder}, ~, env vars)')
+    ap.add_argument(
+        "--out",
+        default="results.xlsx",
+        help='Output Excel (.xlsx) path (supports ${workspaceFolder}, ~, env vars)',
+    )
 
     ap.add_argument("--benchmark", default="SPY.US")
 
@@ -459,9 +556,20 @@ def main() -> None:
 
     ap.add_argument("--macd_fast", type=int, default=12)
     ap.add_argument("--macd_slow", type=int, default=26)
-    ap.add_argument("--macd_signal", type=int, default=9)
+    ap.add_argument("--macd_signal", type=int, default=12)
 
-    ap.add_argument("--avg_vol_days", type=int, default=20, help="Window for avg volume (shares) (default: 20)")
+    ap.add_argument(
+        "--avg_vol_days",
+        type=int,
+        default=None,
+        help="Window for avg volume (trading days). Overrides --avg_vol_months when set.",
+    )
+    ap.add_argument(
+        "--avg_vol_months",
+        type=int,
+        default=6,
+        help="Window for avg volume (calendar months) (default: 6)",
+    )
 
     ap.add_argument(
         "--workers",
@@ -475,10 +583,15 @@ def main() -> None:
         "--avg_dollar_vol_min",
         type=float,
         default=5_000_000.0,
-        help="Minimum average daily $ volume over avg_vol_days (close * volume). Default: 5,000,000",
+        help="Minimum average daily $ volume over avg volume window (close * volume). Default: 5,000,000",
     )
 
     args = ap.parse_args()
+
+    if args.avg_vol_days is not None and args.avg_vol_days <= 0:
+        raise SystemExit("--avg_vol_days must be > 0")
+    if args.avg_vol_months <= 0:
+        raise SystemExit("--avg_vol_months must be > 0")
 
     root = resolve_path(args.root)
     out_path = resolve_path(args.out)
@@ -510,11 +623,22 @@ def main() -> None:
     if args.beta_freq == "monthly":
         beta_rows = args.beta_months * 23 + 10
 
+    if args.avg_vol_days is not None and args.avg_vol_days > 0:
+        avg_vol_mode = "days"
+        avg_vol_days = args.avg_vol_days
+        avg_vol_months = 0
+        avg_vol_need_rows = args.avg_vol_days + 30
+    else:
+        avg_vol_mode = "months"
+        avg_vol_days = 0
+        avg_vol_months = args.avg_vol_months
+        avg_vol_need_rows = args.avg_vol_months * 23 + 30
+
     # Read enough rows from each file to compute beta + indicators + averages.
     need_rows = max(
         beta_rows,
         args.macd_slow + args.macd_signal + 30,
-        args.avg_vol_days + 30,
+        avg_vol_need_rows,
         220,
     )
 
@@ -556,7 +680,9 @@ def main() -> None:
         "macd_fast": args.macd_fast,
         "macd_slow": args.macd_slow,
         "macd_signal": args.macd_signal,
-        "avg_vol_days": args.avg_vol_days,
+        "avg_vol_mode": avg_vol_mode,
+        "avg_vol_days": avg_vol_days,
+        "avg_vol_months": avg_vol_months,
         "avg_dollar_vol_min": args.avg_dollar_vol_min,
     }
 
@@ -582,28 +708,117 @@ def main() -> None:
                 results.append(res)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    if out_path.suffix.lower() != ".xlsx":
+        out_path = out_path.with_suffix(".xlsx")
 
-    fieldnames = ["symbol", "last_close", "beta", "rsi", "macd", "signal", "avg_volume", "avg_dollar_volume"]
+    fieldnames = ["Symbol", "Close $", "Beta", "RSI", "MACD", "Signal", "Avg $ Vol"]
+    data_keys = ["symbol", "last_close", "beta", "rsi", "macd", "signal", "avg_dollar_volume"]
+    data_date = date_from_int(int(bd[-1])) if len(bd) else date.today()
+    headline = data_date.strftime("%d %b %Y").upper()
 
-    with out_path.open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        for row in sorted(results, key=lambda x: str(x["symbol"])):
-            # Round all numeric fields to 2 decimals (max)
-            w.writerow(
-                {
-                    "symbol": row["symbol"],
-                    "last_close": fmt2(row["last_close"]),
-                    "beta": fmt2(row["beta"]),
-                    "rsi": fmt2(row["rsi"]),
-                    "macd": fmt2(row["macd"]),
-                    "signal": fmt2(row["signal"]),
-                    "avg_volume": fmt2(row["avg_volume"]),
-                    "avg_dollar_volume": fmt2(row["avg_dollar_volume"]),
-                }
-            )
+    if out_path.exists():
+        wb = load_workbook(out_path)
+    else:
+        wb = Workbook()
 
-    print(f"Wrote {len(results)} matches to {out_path}")
+    sheet_name = unique_sheet_name(wb, headline)
+    if len(wb.sheetnames) == 1 and is_empty_sheet(wb.active):
+        ws = wb.active
+        ws.title = sheet_name
+    else:
+        ws = wb.create_sheet(title=sheet_name)
+
+    ws.append(fieldnames)
+
+    if args.beta_freq == "monthly":
+        beta_desc = f"{args.beta_months} months\n> {args.beta_min}"
+    else:
+        beta_desc = f"{args.beta_lookback} days\n> {args.beta_min}"
+
+    if avg_vol_mode == "months":
+        avg_desc = f"{avg_vol_months} months\n> ${args.avg_dollar_vol_min:,.0f}"
+    else:
+        avg_desc = f"{avg_vol_days} days\n> ${args.avg_dollar_vol_min:,.0f}"
+
+    descriptors = [
+        "",
+        "",
+        beta_desc,
+        f"{args.rsi_period} days\n{args.rsi_low} to {args.rsi_high}",
+        f"{args.macd_fast}/{args.macd_slow} EMA\nMACD > Signal",
+        f"{args.macd_signal} days",
+        avg_desc,
+    ]
+    ws.append(descriptors)
+    for row in sorted(results, key=lambda x: str(x["symbol"])):
+        # Round all numeric fields to 2 decimals (max)
+        ws.append(
+            [
+                row["symbol"],
+                float(row["last_close"]),
+                fmt2(row["beta"]),
+                fmt2(row["rsi"]),
+                fmt2(row["macd"]),
+                fmt2(row["signal"]),
+                float(row["avg_dollar_volume"]),
+            ]
+        )
+
+    if ws.max_row > 1:
+        is_row1_empty = all(cell.value is None for cell in ws[1])
+        if is_row1_empty:
+            ws.delete_rows(1, 1)
+
+    header_fill = PatternFill(fill_type="solid", fgColor="000000")
+    header_font = Font(bold=False, color="FFFFFF", size=13)
+    ws.row_dimensions[1].height = 26
+    for cell in ws[1]:
+        cell.font = header_font
+        cell.fill = header_fill
+
+    descriptor_fill = PatternFill(fill_type="solid", fgColor="D9D9D9")
+    descriptor_font = Font(italic=True, color="000000", size=11)
+    for cell in ws[2]:
+        cell.font = descriptor_font
+        cell.fill = descriptor_fill
+        cell.alignment = Alignment(wrap_text=True)
+
+    ws.freeze_panes = "A3"
+
+    last_close_col_idx = data_keys.index("last_close") + 1
+    avg_col_idx = data_keys.index("avg_dollar_volume") + 1
+    base_row_height = ws.sheet_format.defaultRowHeight or 15
+    zebra_fill = PatternFill(fill_type="solid", fgColor="F7F7F7")
+    border_side = Side(style="thin", color="000000")
+    vertical_border = Border(left=border_side, right=border_side)
+    for row_idx in range(3, ws.max_row + 1):
+        last_close_cell = ws.cell(row=row_idx, column=last_close_col_idx)
+        if last_close_cell.value is not None:
+            last_close_cell.number_format = "$#,##0.00"
+
+        avg_cell = ws.cell(row=row_idx, column=avg_col_idx)
+        if avg_cell.value is not None:
+            avg_cell.number_format = "$#,##0.00"
+
+        first_col_cell = ws.cell(row=row_idx, column=1)
+        first_col_cell.font = Font(color="FFFFFF", size=11)
+        first_col_cell.fill = header_fill
+
+        if row_idx % 2 == 0:
+            for col_idx in range(2, ws.max_column + 1):
+                ws.cell(row=row_idx, column=col_idx).fill = zebra_fill
+
+        for col_idx in range(1, ws.max_column + 1):
+            ws.cell(row=row_idx, column=col_idx).border = vertical_border
+
+        current_height = ws.row_dimensions[row_idx].height or base_row_height
+        ws.row_dimensions[row_idx].height = current_height + 2
+
+    auto_size_columns(ws)
+
+    wb.save(out_path)
+
+    print(f"Wrote {len(results)} matches to {out_path} ({sheet_name})")
 
 
 if __name__ == "__main__":

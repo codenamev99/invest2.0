@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# NOTE: Keep LF line endings so bash runs correctly.
 set -euo pipefail
 
 # Run from this script's folder
@@ -23,7 +24,7 @@ fi
 STOOQ_SRC="/Users/v/Downloads/data"
 DATA_DEST="$PROJECT_DIR/data 2"
 TICKERS_FILE="$PROJECT_DIR/nyse_tickers.csv"
-RESULTS_FILE="$PROJECT_DIR/results.csv"
+RESULTS_FILE="$PROJECT_DIR/results.xlsx"
 ROOT_DATA="$PROJECT_DIR/data 2/daily/us"
 BENCHMARK="SPY.US"
 

@@ -23,7 +23,7 @@ rem Set this to your Stooq download path if you want auto refresh
 set "STOOQ_SRC=/Users/v/Downloads/data"
 set "DATA_DEST=%PROJECT_DIR%data 2"
 set "TICKERS_FILE=%PROJECT_DIR%nyse_tickers.csv"
-set "RESULTS_FILE=%PROJECT_DIR%results.csv"
+set "RESULTS_FILE=%PROJECT_DIR%results.xlsx"
 set "ROOT_DATA=%PROJECT_DIR%data 2\daily\us"
 set "BENCHMARK=SPY.US"
 
