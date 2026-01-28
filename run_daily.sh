@@ -22,6 +22,7 @@ fi
 # -------- Configuration --------
 # Set this to your Stooq download path if you want auto refresh
 STOOQ_SRC="/Users/v/Downloads/data"
+STOOQ_MODE="move"
 DATA_DEST="$PROJECT_DIR/data 2"
 TICKERS_FILE="$PROJECT_DIR/nyse_tickers.csv"
 RESULTS_FILE="$PROJECT_DIR/results.xlsx"
@@ -30,7 +31,7 @@ BENCHMARK="SPY.US"
 
 # -------- Daily Steps --------
 if [ -n "$STOOQ_SRC" ]; then
-  $PYTHON_CMD refresh_stooq_dump.py --src "$STOOQ_SRC" --dest "$DATA_DEST"
+  $PYTHON_CMD refresh_stooq_dump.py --src "$STOOQ_SRC" --dest "$DATA_DEST" --mode "$STOOQ_MODE"
 else
   echo "Skipping data refresh. Set STOOQ_SRC in run_daily.sh to enable."
 fi

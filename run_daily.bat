@@ -21,6 +21,7 @@ if exist ".venv\Scripts\activate.bat" (
 rem -------- Configuration --------
 rem Set this to your Stooq download path if you want auto refresh
 set "STOOQ_SRC=/Users/v/Downloads/data"
+set "STOOQ_MODE=move"
 set "DATA_DEST=%PROJECT_DIR%data 2"
 set "TICKERS_FILE=%PROJECT_DIR%nyse_tickers.csv"
 set "RESULTS_FILE=%PROJECT_DIR%results.xlsx"
@@ -29,7 +30,7 @@ set "BENCHMARK=SPY.US"
 
 rem -------- Daily Steps --------
 if not "%STOOQ_SRC%"=="" (
-    %PYTHON_CMD% refresh_stooq_dump.py --src "%STOOQ_SRC%" --dest "%DATA_DEST%"
+    %PYTHON_CMD% refresh_stooq_dump.py --src "%STOOQ_SRC%" --dest "%DATA_DEST%" --mode "%STOOQ_MODE%"
 ) else (
     echo Skipping data refresh. Set STOOQ_SRC in run_daily.bat to enable.
 )

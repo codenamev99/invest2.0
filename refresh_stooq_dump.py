@@ -140,7 +140,11 @@ def main() -> None:
         "--mode",
         choices=["copy", "move"],
         default="copy",
-        help="copy = keep the source intact (default). move = move folder into project (removes it from Downloads)."
+        help=(
+            "copy = keep the source intact (default). "
+            "move = move folder into project (removes it from Downloads; "
+            "if source is a zip, it will be deleted after a successful update)."
+        ),
     )
 
     args = ap.parse_args()
@@ -165,6 +169,14 @@ def main() -> None:
         if args.mode == "move":
             # Fast: move folder into place (removes it from Downloads)
             atomic_replace(dest_dir, src_data_dir)
+
+            # If a parent folder was provided, clean it up if now empty.
+            if src_data_dir != src_path and src_path.exists():
+                try:
+                    if not any(src_path.iterdir()):
+                        src_path.rmdir()
+                except OSError:
+                    pass
         else:
             # Safe: copy into project then swap
             staged = stage_copy_to_dest_parent(src_data_dir, dest_dir)
@@ -181,6 +193,13 @@ def main() -> None:
 
         staged = stage_copy_to_dest_parent(src_data_dir, dest_dir)
         atomic_replace(dest_dir, staged)
+
+    if args.mode == "move":
+        try:
+            src_path.unlink()
+            print(f"🧹 Deleted source archive: {src_path}")
+        except OSError:
+            print(f"⚠️  Could not delete source archive: {src_path}")
 
     print(f"✅ Replaced project data folder at: {dest_dir}")
 
