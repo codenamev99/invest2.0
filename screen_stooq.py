@@ -454,6 +454,10 @@ def screen_symbol(
     if not (last_macd > last_sig):
         return None
 
+    macd_signal_ratio = np.nan
+    if np.isfinite(last_macd) and np.isfinite(last_sig) and last_sig != 0:
+        macd_signal_ratio = last_macd / last_sig
+
     if params["beta_freq"] == "monthly":
         sm, smc = monthly_closes(d, c)
         if len(sm) < params["beta_months"] + 1:
@@ -501,6 +505,7 @@ def screen_symbol(
         "rsi": last_rsi,
         "macd": last_macd,
         "signal": last_sig,
+        "macd_signal_ratio": macd_signal_ratio,
         "avg_dollar_volume": avg_dollar_volume,
     }
 
@@ -711,8 +716,17 @@ def main() -> None:
     if out_path.suffix.lower() != ".xlsx":
         out_path = out_path.with_suffix(".xlsx")
 
-    fieldnames = ["Symbol", "Close $", "Beta", "RSI", "MACD", "Signal", "Avg $ Vol"]
-    data_keys = ["symbol", "last_close", "beta", "rsi", "macd", "signal", "avg_dollar_volume"]
+    fieldnames = ["Symbol", "Close $", "Beta", "RSI", "MACD", "Signal", "MACD/Signal", "Avg $ Vol"]
+    data_keys = [
+        "symbol",
+        "last_close",
+        "beta",
+        "rsi",
+        "macd",
+        "signal",
+        "macd_signal_ratio",
+        "avg_dollar_volume",
+    ]
     data_date = date_from_int(int(bd[-1])) if len(bd) else date.today()
     headline = data_date.strftime("%d %b %Y").upper()
 
@@ -747,6 +761,7 @@ def main() -> None:
         f"{args.rsi_period} days\n{args.rsi_low} to {args.rsi_high}",
         f"{args.macd_fast}/{args.macd_slow} EMA\nMACD > Signal",
         f"{args.macd_signal} days",
+        "MACD / Signal",
         avg_desc,
     ]
     ws.append(descriptors)
@@ -760,6 +775,7 @@ def main() -> None:
                 fmt2(row["rsi"]),
                 fmt2(row["macd"]),
                 fmt2(row["signal"]),
+                fmt2(row["macd_signal_ratio"]),
                 float(row["avg_dollar_volume"]),
             ]
         )
