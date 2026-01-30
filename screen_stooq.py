@@ -346,6 +346,18 @@ def fmt2(x: Any) -> str:
         return str(x)
 
 
+def pct_change(current: float, previous: float) -> float:
+    """
+    Percent change from previous to current.
+    Returns NaN when previous is 0 or either value is non-finite.
+    """
+    if not (np.isfinite(current) and np.isfinite(previous)):
+        return np.nan
+    if previous == 0:
+        return np.nan
+    return (current - previous) / previous * 100.0
+
+
 def unique_sheet_name(wb: Workbook, base: str) -> str:
     """
     Return a unique worksheet name (<= 31 chars) for the workbook.
@@ -419,6 +431,9 @@ def screen_symbol(
     if len(d) < min_rows:
         return None
 
+    change_lookback = 5  # trading periods
+    prev_idx = -(change_lookback + 1)
+
     # Average daily $ volume filter (close * volume) over avg volume window
     if params["avg_vol_mode"] == "months":
         last_date = date_from_int(int(d[-1]))
@@ -439,11 +454,31 @@ def screen_symbol(
     if avg_dollar_volume <= params["avg_dollar_vol_min"]:
         return None
 
+    avg_dollar_volume_prev = np.nan
+    if len(d) >= change_lookback + 1:
+        if params["avg_vol_mode"] == "months":
+            last_date_prev = date_from_int(int(d[prev_idx]))
+            cutoff_date_prev = shift_months(last_date_prev, -int(params["avg_vol_months"]))
+            cutoff_int_prev = date_to_int(cutoff_date_prev)
+            last_date_prev_int = date_to_int(last_date_prev)
+            mask_prev = (d >= cutoff_int_prev) & (d <= last_date_prev_int)
+            if np.any(mask_prev):
+                avg_dollar_volume_prev = float(np.mean(c[mask_prev] * v[mask_prev]))
+        else:
+            lookback_days = int(params["avg_vol_days"])
+            if len(c) >= lookback_days + change_lookback:
+                close_window_prev = c[-(lookback_days + change_lookback):-change_lookback]
+                vol_window_prev = v[-(lookback_days + change_lookback):-change_lookback]
+                if len(close_window_prev) and len(vol_window_prev):
+                    avg_dollar_volume_prev = float(np.mean(close_window_prev * vol_window_prev))
+
     last_close = float(c[-1])
+    prev_close = float(c[prev_idx]) if len(c) >= change_lookback + 1 else np.nan
 
     # RSI filter
     rsi_vals = rsi_wilder(c, period=params["rsi_period"])
     last_rsi = float(rsi_vals[-1])
+    prev_rsi = float(rsi_vals[prev_idx]) if len(rsi_vals) >= change_lookback + 1 else np.nan
     if not (params["rsi_low"] <= last_rsi <= params["rsi_high"]):
         return None
 
@@ -451,12 +486,17 @@ def screen_symbol(
     macd_line, sig_line = macd(c, params["macd_fast"], params["macd_slow"], params["macd_signal"])
     last_macd = float(macd_line[-1])
     last_sig = float(sig_line[-1])
+    prev_macd = float(macd_line[prev_idx]) if len(macd_line) >= change_lookback + 1 else np.nan
+    prev_sig = float(sig_line[prev_idx]) if len(sig_line) >= change_lookback + 1 else np.nan
     if not (last_macd > last_sig):
         return None
 
     macd_signal_ratio = np.nan
     if np.isfinite(last_macd) and np.isfinite(last_sig) and last_sig != 0:
         macd_signal_ratio = last_macd / last_sig
+    macd_signal_ratio_prev = np.nan
+    if np.isfinite(prev_macd) and np.isfinite(prev_sig) and prev_sig != 0:
+        macd_signal_ratio_prev = prev_macd / prev_sig
 
     if params["beta_freq"] == "monthly":
         sm, smc = monthly_closes(d, c)
@@ -477,6 +517,15 @@ def screen_symbol(
 
         stock_close_aligned = np.array(stock_aligned[-(params["beta_months"] + 1):], dtype=float)
         bench_close_aligned = np.array(bench_aligned[-(params["beta_months"] + 1):], dtype=float)
+        beta_prev = np.nan
+        if len(stock_aligned) >= params["beta_months"] + 1 + change_lookback:
+            prev_stock = np.array(stock_aligned[:-change_lookback], dtype=float)
+            prev_bench = np.array(bench_aligned[:-change_lookback], dtype=float)
+            if len(prev_stock) >= params["beta_months"] + 1:
+                beta_prev = beta_from_aligned_closes(
+                    prev_stock[-(params["beta_months"] + 1):],
+                    prev_bench[-(params["beta_months"] + 1):],
+                )
     else:
         # Align stock closes to benchmark dates for beta (no dict/sort needed)
         stock_aligned = []
@@ -493,20 +542,44 @@ def screen_symbol(
 
         stock_close_aligned = np.array(stock_aligned[-(params["beta_lookback"] + 1):], dtype=float)
         bench_close_aligned = np.array(bench_aligned[-(params["beta_lookback"] + 1):], dtype=float)
+        beta_prev = np.nan
+        if len(stock_aligned) >= params["beta_lookback"] + 1 + change_lookback:
+            prev_stock = np.array(stock_aligned[:-change_lookback], dtype=float)
+            prev_bench = np.array(bench_aligned[:-change_lookback], dtype=float)
+            if len(prev_stock) >= params["beta_lookback"] + 1:
+                beta_prev = beta_from_aligned_closes(
+                    prev_stock[-(params["beta_lookback"] + 1):],
+                    prev_bench[-(params["beta_lookback"] + 1):],
+                )
 
     b = beta_from_aligned_closes(stock_close_aligned, bench_close_aligned)
     if not np.isfinite(b) or b <= params["beta_min"]:
         return None
 
+    close_pct_5 = pct_change(last_close, prev_close)
+    beta_pct_5 = pct_change(b, beta_prev)
+    rsi_pct_5 = pct_change(last_rsi, prev_rsi)
+    macd_pct_5 = pct_change(last_macd, prev_macd)
+    signal_pct_5 = pct_change(last_sig, prev_sig)
+    macd_signal_ratio_pct_5 = pct_change(macd_signal_ratio, macd_signal_ratio_prev)
+    avg_dollar_volume_pct_5 = pct_change(avg_dollar_volume, avg_dollar_volume_prev)
+
     return {
         "symbol": display_symbol(sym),  # NO ".US" in output
         "last_close": last_close,
+        "last_close_pct_5": close_pct_5,
         "beta": b,
+        "beta_pct_5": beta_pct_5,
         "rsi": last_rsi,
+        "rsi_pct_5": rsi_pct_5,
         "macd": last_macd,
+        "macd_pct_5": macd_pct_5,
         "signal": last_sig,
+        "signal_pct_5": signal_pct_5,
         "macd_signal_ratio": macd_signal_ratio,
+        "macd_signal_ratio_pct_5": macd_signal_ratio_pct_5,
         "avg_dollar_volume": avg_dollar_volume,
+        "avg_dollar_volume_pct_5": avg_dollar_volume_pct_5,
     }
 
 
@@ -716,16 +789,39 @@ def main() -> None:
     if out_path.suffix.lower() != ".xlsx":
         out_path = out_path.with_suffix(".xlsx")
 
-    fieldnames = ["Symbol", "Close $", "Beta", "RSI", "MACD", "Signal", "MACD/Signal", "Avg $ Vol"]
+    fieldnames = [
+        "Symbol",
+        "Close $",
+        "Close 5D %",
+        "Beta",
+        "Beta 5D %",
+        "RSI",
+        "RSI 5D %",
+        "MACD",
+        "MACD 5D %",
+        "Signal",
+        "Signal 5D %",
+        "MACD/Signal",
+        "MACD/Signal 5D %",
+        "Avg $ Vol",
+        "Avg $ Vol 5D %",
+    ]
     data_keys = [
         "symbol",
         "last_close",
+        "last_close_pct_5",
         "beta",
+        "beta_pct_5",
         "rsi",
+        "rsi_pct_5",
         "macd",
+        "macd_pct_5",
         "signal",
+        "signal_pct_5",
         "macd_signal_ratio",
+        "macd_signal_ratio_pct_5",
         "avg_dollar_volume",
+        "avg_dollar_volume_pct_5",
     ]
     data_date = date_from_int(int(bd[-1])) if len(bd) else date.today()
     headline = data_date.strftime("%d %b %Y").upper()
@@ -754,15 +850,24 @@ def main() -> None:
     else:
         avg_desc = f"{avg_vol_days} days\n> ${args.avg_dollar_vol_min:,.0f}"
 
+    pct_desc = "5 days %"
+    beta_change_desc = "5 months %" if args.beta_freq == "monthly" else pct_desc
     descriptors = [
         "",
         "",
+        pct_desc,
         beta_desc,
+        beta_change_desc,
         f"{args.rsi_period} days\n{args.rsi_low} to {args.rsi_high}",
+        pct_desc,
         f"{args.macd_fast}/{args.macd_slow} EMA\nMACD > Signal",
+        pct_desc,
         f"{args.macd_signal} days",
+        pct_desc,
         "MACD / Signal",
+        pct_desc,
         avg_desc,
+        pct_desc,
     ]
     ws.append(descriptors)
     for row in sorted(results, key=lambda x: str(x["symbol"])):
@@ -771,12 +876,19 @@ def main() -> None:
             [
                 row["symbol"],
                 float(row["last_close"]),
+                fmt2(row["last_close_pct_5"]),
                 fmt2(row["beta"]),
+                fmt2(row["beta_pct_5"]),
                 fmt2(row["rsi"]),
+                fmt2(row["rsi_pct_5"]),
                 fmt2(row["macd"]),
+                fmt2(row["macd_pct_5"]),
                 fmt2(row["signal"]),
+                fmt2(row["signal_pct_5"]),
                 fmt2(row["macd_signal_ratio"]),
+                fmt2(row["macd_signal_ratio_pct_5"]),
                 float(row["avg_dollar_volume"]),
+                fmt2(row["avg_dollar_volume_pct_5"]),
             ]
         )
 
@@ -791,13 +903,14 @@ def main() -> None:
     for cell in ws[1]:
         cell.font = header_font
         cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center")
 
     descriptor_fill = PatternFill(fill_type="solid", fgColor="D9D9D9")
     descriptor_font = Font(italic=True, color="000000", size=11)
     for cell in ws[2]:
         cell.font = descriptor_font
         cell.fill = descriptor_fill
-        cell.alignment = Alignment(wrap_text=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
     ws.freeze_panes = "A3"
 
@@ -805,8 +918,12 @@ def main() -> None:
     avg_col_idx = data_keys.index("avg_dollar_volume") + 1
     base_row_height = ws.sheet_format.defaultRowHeight or 15
     zebra_fill = PatternFill(fill_type="solid", fgColor="F7F7F7")
-    border_side = Side(style="thin", color="000000")
-    vertical_border = Border(left=border_side, right=border_side)
+    pct_col_idxs = [idx + 1 for idx, key in enumerate(data_keys) if key.endswith("_pct_5")]
+    thin_side = Side(style="thin", color="000000")
+    thick_side = Side(style="thick", color="000000")
+    vertical_border = Border(left=thin_side, right=thin_side)
+    separator_border = Border(left=thin_side, right=thick_side)
+    next_separator_border = Border(left=thick_side, right=thin_side)
     for row_idx in range(3, ws.max_row + 1):
         last_close_cell = ws.cell(row=row_idx, column=last_close_col_idx)
         if last_close_cell.value is not None:
@@ -825,7 +942,13 @@ def main() -> None:
                 ws.cell(row=row_idx, column=col_idx).fill = zebra_fill
 
         for col_idx in range(1, ws.max_column + 1):
-            ws.cell(row=row_idx, column=col_idx).border = vertical_border
+            if col_idx in pct_col_idxs:
+                border = separator_border
+            elif (col_idx - 1) in pct_col_idxs:
+                border = next_separator_border
+            else:
+                border = vertical_border
+            ws.cell(row=row_idx, column=col_idx).border = border
 
         current_height = ws.row_dimensions[row_idx].height or base_row_height
         ws.row_dimensions[row_idx].height = current_height + 2
