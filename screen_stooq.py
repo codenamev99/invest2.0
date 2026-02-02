@@ -61,14 +61,17 @@ def read_last_lines(path: Path, n: int = 600) -> list[str]:
     return [ln.decode("utf-8", errors="ignore") for ln in tail]
 
 
-def load_series_from_file(path: Path, need_rows: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def load_series_from_file(
+    path: Path,
+    need_rows: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Returns (dates_int, close, volume) sorted by date.
+    Returns (dates_int, close, volume, high, low) sorted by date.
     date_int is YYYYMMDD (int).
     """
     lines = read_last_lines(path, n=need_rows)
 
-    rows: list[tuple[int, float, float]] = []
+    rows: list[tuple[int, float, float, float, float]] = []
     for ln in lines:
         ln = ln.strip()
         if not ln or ln.startswith("<TICKER>"):
@@ -84,21 +87,26 @@ def load_series_from_file(path: Path, need_rows: int) -> tuple[np.ndarray, np.nd
 
         try:
             date_i = int(parts[2])
+            high = float(parts[5])
+            low = float(parts[6])
             close = float(parts[7])
             vol = float(parts[8])
         except ValueError:
             continue
 
-        rows.append((date_i, close, vol))
+        rows.append((date_i, close, vol, high, low))
 
     if not rows:
-        return np.array([], dtype=np.int32), np.array([], dtype=float), np.array([], dtype=float)
+        empty = np.array([], dtype=float)
+        return np.array([], dtype=np.int32), empty, empty, empty, empty
 
     rows.sort(key=lambda x: x[0])
     d = np.array([r[0] for r in rows], dtype=np.int32)
     c = np.array([r[1] for r in rows], dtype=float)
     v = np.array([r[2] for r in rows], dtype=float)
-    return d, c, v
+    h = np.array([r[3] for r in rows], dtype=float)
+    l = np.array([r[4] for r in rows], dtype=float)
+    return d, c, v, h, l
 
 
 # -----------------------------
@@ -153,6 +161,32 @@ def rsi_wilder(close: np.ndarray, period: int = 14) -> np.ndarray:
             rsi[idx] = 100.0 - (100.0 / (1.0 + rs))
 
     return rsi
+
+
+def atr_wilder(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> np.ndarray:
+    """
+    Average True Range (Wilder). Returns array aligned to close with NaNs early.
+    """
+    high = high.astype(float)
+    low = low.astype(float)
+    close = close.astype(float)
+    n = len(close)
+    atr = np.full(n, np.nan, dtype=float)
+    if n < period + 1:
+        return atr
+
+    tr = np.full(n, np.nan, dtype=float)
+    tr[0] = high[0] - low[0]
+    hl = high[1:] - low[1:]
+    hc = np.abs(high[1:] - close[:-1])
+    lc = np.abs(low[1:] - close[:-1])
+    tr[1:] = np.maximum(hl, np.maximum(hc, lc))
+
+    atr[period] = float(np.mean(tr[1 : period + 1]))
+    for i in range(period + 1, n):
+        atr[i] = (atr[i - 1] * (period - 1) + tr[i]) / period
+
+    return atr
 
 
 def macd(close: np.ndarray, fast: int = 12, slow: int = 26, signal: int = 9) -> tuple[np.ndarray, np.ndarray]:
@@ -519,10 +553,11 @@ def screen_symbol(
     bench_map: dict[int, float],
     need_rows: int,
 ) -> dict[str, Any] | None:
-    d, c, v = load_series_from_file(path, need_rows=need_rows)
+    d, c, v, h, l = load_series_from_file(path, need_rows=need_rows)
     min_rows = 60
     if params["avg_vol_mode"] == "days":
         min_rows = max(params["avg_vol_days"] + 1, min_rows)
+    min_rows = max(min_rows, params["rsi_period"] + 2, params["atr_period"] + 2)
     if len(d) < min_rows:
         return None
 
@@ -575,6 +610,15 @@ def screen_symbol(
     last_rsi = float(rsi_vals[-1])
     prev_rsi = float(rsi_vals[prev_idx]) if len(rsi_vals) >= change_lookback + 1 else np.nan
     if not (params["rsi_low"] <= last_rsi <= params["rsi_high"]):
+        return None
+
+    # ATR filter (percent of last close)
+    atr_vals = atr_wilder(h, l, c, period=params["atr_period"])
+    last_atr = float(atr_vals[-1])
+    atr_pct = np.nan
+    if np.isfinite(last_atr) and last_close > 0:
+        atr_pct = (last_atr / last_close) * 100.0
+    if not np.isfinite(atr_pct) or atr_pct <= params["atr_min_pct"]:
         return None
 
     # MACD filter
@@ -667,6 +711,8 @@ def screen_symbol(
         "beta_pct_5": beta_pct_5,
         "rsi": last_rsi,
         "rsi_pct_5": rsi_pct_5,
+        "atr": last_atr,
+        "atr_pct": atr_pct,
         "macd": last_macd,
         "macd_pct_5": macd_pct_5,
         "signal": last_sig,
@@ -727,6 +773,14 @@ def main() -> None:
     ap.add_argument("--rsi_high", type=float, default=70.0)
     ap.add_argument("--rsi_period", type=int, default=14)
 
+    ap.add_argument("--atr_period", type=int, default=14, help="ATR period in days (default: 14)")
+    ap.add_argument(
+        "--atr_min_pct",
+        type=float,
+        default=2.0,
+        help="Minimum ATR as percent of last close (default: 2.0)",
+    )
+
     ap.add_argument("--macd_fast", type=int, default=12)
     ap.add_argument("--macd_slow", type=int, default=26)
     ap.add_argument("--macd_signal", type=int, default=12)
@@ -765,6 +819,10 @@ def main() -> None:
         raise SystemExit("--avg_vol_days must be > 0")
     if args.avg_vol_months <= 0:
         raise SystemExit("--avg_vol_months must be > 0")
+    if args.atr_period <= 0:
+        raise SystemExit("--atr_period must be > 0")
+    if args.atr_min_pct < 0:
+        raise SystemExit("--atr_min_pct must be >= 0")
 
     root = resolve_path(args.root)
     out_path = resolve_path(args.out)
@@ -812,11 +870,12 @@ def main() -> None:
         beta_rows,
         args.macd_slow + args.macd_signal + 30,
         avg_vol_need_rows,
+        args.atr_period + 30,
         220,
     )
 
     # Load benchmark series (tail), build date->close map or month->close map
-    bd, bc, _bv = load_series_from_file(bench_path, need_rows=need_rows)
+    bd, bc, _bv, _bh, _bl = load_series_from_file(bench_path, need_rows=need_rows)
     if args.beta_freq == "monthly":
         bm, bmc = monthly_closes(bd, bc)
         if len(bm) < args.beta_months + 1:
@@ -850,6 +909,8 @@ def main() -> None:
         "rsi_low": args.rsi_low,
         "rsi_high": args.rsi_high,
         "rsi_period": args.rsi_period,
+        "atr_period": args.atr_period,
+        "atr_min_pct": args.atr_min_pct,
         "macd_fast": args.macd_fast,
         "macd_slow": args.macd_slow,
         "macd_signal": args.macd_signal,
@@ -902,6 +963,7 @@ def main() -> None:
         "Beta 5D %",
         "RSI",
         "RSI 5D %",
+        "ATR %",
         "MACD",
         "MACD 5D %",
         "Signal",
@@ -921,6 +983,7 @@ def main() -> None:
         "beta_pct_5",
         "rsi",
         "rsi_pct_5",
+        "atr_pct",
         "macd",
         "macd_pct_5",
         "signal",
@@ -969,6 +1032,7 @@ def main() -> None:
         beta_change_desc,
         f"{args.rsi_period} days\n{args.rsi_low} to {args.rsi_high}",
         pct_desc,
+        f"{args.atr_period} days\n> {args.atr_min_pct}% of close",
         f"{args.macd_fast}/{args.macd_slow} EMA\nMACD > Signal",
         pct_desc,
         f"{args.macd_signal} days",
@@ -992,6 +1056,7 @@ def main() -> None:
                 fmt2(row["beta_pct_5"]),
                 fmt2(row["rsi"]),
                 fmt2(row["rsi_pct_5"]),
+                fmt2(row["atr_pct"]),
                 fmt2(row["macd"]),
                 fmt2(row["macd_pct_5"]),
                 fmt2(row["signal"]),
@@ -1029,14 +1094,29 @@ def main() -> None:
 
     last_close_col_idx = data_keys.index("last_close") + 1
     avg_col_idx = data_keys.index("avg_dollar_volume") + 1
+    pct_format_cols = [
+        data_keys.index(key) + 1
+        for key in [
+            "last_close_pct_5",
+            "beta_pct_5",
+            "rsi_pct_5",
+            "atr_pct",
+            "macd_pct_5",
+            "signal_pct_5",
+            "macd_signal_ratio_pct_5",
+        ]
+        if key in data_keys
+    ]
     base_row_height = ws.sheet_format.defaultRowHeight or 15
     zebra_fill = PatternFill(fill_type="solid", fgColor="F7F7F7")
     pct_col_idxs = [idx + 1 for idx, key in enumerate(data_keys) if key.endswith("_pct_5")]
+    atr_pct_col_idx = data_keys.index("atr_pct") + 1 if "atr_pct" in data_keys else None
     thin_side = Side(style="thin", color="000000")
     thick_side = Side(style="thick", color="000000")
     vertical_border = Border(left=thin_side, right=thin_side)
     separator_border = Border(left=thin_side, right=thick_side)
     next_separator_border = Border(left=thick_side, right=thin_side)
+    atr_separator_border = Border(left=thick_side, right=thick_side)
     for row_idx in range(3, ws.max_row + 1):
         last_close_cell = ws.cell(row=row_idx, column=last_close_col_idx)
         if last_close_cell.value is not None:
@@ -1045,6 +1125,11 @@ def main() -> None:
         avg_cell = ws.cell(row=row_idx, column=avg_col_idx)
         if avg_cell.value is not None:
             avg_cell.number_format = "$#,##0.00"
+
+        for col_idx in pct_format_cols:
+            pct_cell = ws.cell(row=row_idx, column=col_idx)
+            if pct_cell.value is not None:
+                pct_cell.number_format = '0.0"%"'
 
         first_col_cell = ws.cell(row=row_idx, column=1)
         first_col_cell.font = Font(color="FFFFFF", size=11)
@@ -1055,8 +1140,15 @@ def main() -> None:
                 ws.cell(row=row_idx, column=col_idx).fill = zebra_fill
 
         for col_idx in range(1, ws.max_column + 1):
-            if col_idx in pct_col_idxs:
-                border = separator_border
+            if atr_pct_col_idx is not None and col_idx == atr_pct_col_idx:
+                border = atr_separator_border
+            elif atr_pct_col_idx is not None and col_idx == atr_pct_col_idx + 1:
+                border = next_separator_border
+            elif col_idx in pct_col_idxs:
+                if atr_pct_col_idx is not None and col_idx + 1 == atr_pct_col_idx:
+                    border = separator_border
+                else:
+                    border = separator_border
             elif (col_idx - 1) in pct_col_idxs:
                 border = next_separator_border
             else:
