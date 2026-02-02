@@ -1021,11 +1021,11 @@ def main() -> None:
         "Close $",
         "Close 5D %",
         "52W High Close",
-        "52W High Days Ago",
+        "52W High",
         "All-Time High Close",
-        "All-Time High Days Ago",
-        "Last 5% Higher Date",
-        "Last 5% Higher Days Ago",
+        "All-Time High",
+        "Last 5% Higher",
+        "Last 5% Higher",
         "Beta",
         "Beta 5D %",
         "RSI",
@@ -1163,7 +1163,7 @@ def main() -> None:
             ws.delete_rows(1, 1)
 
     header_fill = PatternFill(fill_type="solid", fgColor="000000")
-    header_font = Font(bold=False, color="FFFFFF", size=13)
+    header_font = Font(bold=True, color="FFFFFF", size=13)
     ws.row_dimensions[1].height = 26
     for cell in ws[1]:
         cell.font = header_font
@@ -1177,7 +1177,7 @@ def main() -> None:
         cell.fill = descriptor_fill
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
-    ws.freeze_panes = "A3"
+    ws.freeze_panes = "B3"
 
     currency_keys = ["last_close", "high_52w_close", "high_all_close", "avg_dollar_volume"]
     currency_col_idxs = [data_keys.index(key) + 1 for key in currency_keys if key in data_keys]
@@ -1195,7 +1195,10 @@ def main() -> None:
         if key in data_keys
     ]
     base_row_height = ws.sheet_format.defaultRowHeight or 15
-    zebra_fill = PatternFill(fill_type="solid", fgColor="F7F7F7")
+    group_fills = [
+        PatternFill(fill_type="solid", fgColor="F7F7F7"),
+        PatternFill(fill_type="solid", fgColor="FFFFFF"),
+    ]
     pct_col_idxs = [idx + 1 for idx, key in enumerate(data_keys) if key.endswith("_pct_5")]
     atr_pct_col_idx = data_keys.index("atr_pct") + 1 if "atr_pct" in data_keys else None
     separator_after_keys = [
@@ -1211,7 +1214,37 @@ def main() -> None:
     separator_border = Border(left=thin_side, right=thick_side)
     next_separator_border = Border(left=thick_side, right=thin_side)
     atr_separator_border = Border(left=thick_side, right=thick_side)
+    group_key_sets = [
+        ["last_close", "last_close_pct_5"],
+        ["high_52w_close", "high_52w_days_ago"],
+        ["high_all_close", "high_all_days_ago"],
+        ["last_5pct_higher_date", "last_5pct_higher_days_ago"],
+        ["beta", "beta_pct_5"],
+        ["rsi", "rsi_pct_5"],
+        ["atr_pct"],
+        [
+            "macd",
+            "macd_pct_5",
+            "signal",
+            "signal_pct_5",
+            "macd_signal_ratio",
+            "macd_signal_ratio_pct_5",
+        ],
+        ["avg_dollar_volume", "avg_dollar_volume_pct_5"],
+        ["last_earnings_date", "next_earnings_date"],
+    ]
+    for group_idx, group_keys in enumerate(group_key_sets):
+        fill = group_fills[group_idx % len(group_fills)]
+        for key in group_keys:
+            if key not in data_keys:
+                continue
+            col_idx = data_keys.index(key) + 1
+            ws.cell(row=2, column=col_idx).fill = fill
     for row_idx in range(3, ws.max_row + 1):
+        for col_idx in (5, 7, 9):  # E, G, I
+            cell = ws.cell(row=row_idx, column=col_idx)
+            cell.alignment = Alignment(horizontal="left", vertical="center")
+
         for col_idx in currency_col_idxs:
             cur_cell = ws.cell(row=row_idx, column=col_idx)
             if cur_cell.value is not None:
@@ -1226,9 +1259,13 @@ def main() -> None:
         first_col_cell.font = Font(color="FFFFFF", size=11)
         first_col_cell.fill = header_fill
 
-        if row_idx % 2 == 0:
-            for col_idx in range(2, ws.max_column + 1):
-                ws.cell(row=row_idx, column=col_idx).fill = zebra_fill
+        for group_idx, group_keys in enumerate(group_key_sets):
+            fill = group_fills[group_idx % len(group_fills)]
+            for key in group_keys:
+                if key not in data_keys:
+                    continue
+                col_idx = data_keys.index(key) + 1
+                ws.cell(row=row_idx, column=col_idx).fill = fill
 
         for col_idx in range(1, ws.max_column + 1):
             if atr_pct_col_idx is not None and col_idx == atr_pct_col_idx:
