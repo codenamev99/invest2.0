@@ -487,6 +487,54 @@ def pct_change(current: float, previous: float) -> float:
     return (current - previous) / previous * 100.0
 
 
+def max_close_and_days_ago(
+    dates: np.ndarray,
+    closes: np.ndarray,
+    last_date: date,
+    cutoff_int: int | None = None,
+) -> tuple[float | None, int | None]:
+    """
+    Max close (most recent if tied) and calendar days since that date.
+    Optionally restrict to dates >= cutoff_int (YYYYMMDD).
+    """
+    if len(dates) == 0 or len(closes) == 0:
+        return None, None
+    if cutoff_int is not None:
+        mask = dates >= cutoff_int
+        if not np.any(mask):
+            return None, None
+        dates = dates[mask]
+        closes = closes[mask]
+    max_close = float(np.max(closes))
+    idxs = np.where(closes == max_close)[0]
+    if len(idxs) == 0:
+        return None, None
+    max_date_int = int(dates[idxs[-1]])
+    days_ago = (last_date - date_from_int(max_date_int)).days
+    return max_close, int(days_ago)
+
+
+def last_close_5pct_higher_info(
+    dates: np.ndarray,
+    closes: np.ndarray,
+    last_close: float,
+    last_date: date,
+) -> tuple[str | None, int | None]:
+    """
+    Last date when close >= 5% above the most recent close.
+    Returns (MM/DD/YYYY, days_ago). Excludes the most recent close.
+    """
+    if len(closes) < 2 or not np.isfinite(last_close):
+        return "", None
+    threshold = last_close * 1.05
+    mask = closes[:-1] >= threshold
+    if not np.any(mask):
+        return "", None
+    idx = int(np.where(mask)[0][-1])
+    dt = date_from_int(int(dates[idx]))
+    return _format_mmddyyyy(dt), int((last_date - dt).days)
+
+
 def unique_sheet_name(wb: Workbook, base: str) -> str:
     """
     Return a unique worksheet name (<= 31 chars) for the workbook.
@@ -603,7 +651,14 @@ def screen_symbol(
                     avg_dollar_volume_prev = float(np.mean(close_window_prev * vol_window_prev))
 
     last_close = float(c[-1])
+    last_date = date_from_int(int(d[-1]))
     prev_close = float(c[prev_idx]) if len(c) >= change_lookback + 1 else np.nan
+
+    cutoff_52_date = last_date - timedelta(days=364)
+    cutoff_52_int = date_to_int(cutoff_52_date)
+    high_52_close, high_52_days = max_close_and_days_ago(d, c, last_date, cutoff_52_int)
+    high_all_close, high_all_days = max_close_and_days_ago(d, c, last_date, None)
+    last_5pct_date, last_5pct_days = last_close_5pct_higher_info(d, c, last_close, last_date)
 
     # RSI filter
     rsi_vals = rsi_wilder(c, period=params["rsi_period"])
@@ -707,6 +762,12 @@ def screen_symbol(
         "symbol": display_symbol(sym),  # NO ".US" in output
         "last_close": last_close,
         "last_close_pct_5": close_pct_5,
+        "high_52w_close": high_52_close,
+        "high_52w_days_ago": high_52_days,
+        "high_all_close": high_all_close,
+        "high_all_days_ago": high_all_days,
+        "last_5pct_higher_date": last_5pct_date,
+        "last_5pct_higher_days_ago": last_5pct_days,
         "beta": b,
         "beta_pct_5": beta_pct_5,
         "rsi": last_rsi,
@@ -871,7 +932,7 @@ def main() -> None:
         args.macd_slow + args.macd_signal + 30,
         avg_vol_need_rows,
         args.atr_period + 30,
-        220,
+        260,
     )
 
     # Load benchmark series (tail), build date->close map or month->close map
@@ -959,6 +1020,12 @@ def main() -> None:
         "Symbol",
         "Close $",
         "Close 5D %",
+        "52W High Close",
+        "52W High Days Ago",
+        "All-Time High Close",
+        "All-Time High Days Ago",
+        "Last 5% Higher Date",
+        "Last 5% Higher Days Ago",
         "Beta",
         "Beta 5D %",
         "RSI",
@@ -979,6 +1046,12 @@ def main() -> None:
         "symbol",
         "last_close",
         "last_close_pct_5",
+        "high_52w_close",
+        "high_52w_days_ago",
+        "high_all_close",
+        "high_all_days_ago",
+        "last_5pct_higher_date",
+        "last_5pct_higher_days_ago",
         "beta",
         "beta_pct_5",
         "rsi",
@@ -1028,6 +1101,12 @@ def main() -> None:
         "",
         "",
         pct_desc,
+        "52W high\nClose $",
+        "Days ago",
+        "All-time high\nClose $",
+        "Days ago",
+        "MM/DD/YYYY",
+        "Days ago",
         beta_desc,
         beta_change_desc,
         f"{args.rsi_period} days\n{args.rsi_low} to {args.rsi_high}",
@@ -1046,12 +1125,20 @@ def main() -> None:
     ]
     ws.append(descriptors)
     for row in sorted(results, key=lambda x: str(x["symbol"])):
+        high_52_close = row.get("high_52w_close")
+        high_all_close = row.get("high_all_close")
         # Round all numeric fields to 2 decimals (max)
         ws.append(
             [
                 row["symbol"],
                 float(row["last_close"]),
                 fmt2(row["last_close_pct_5"]),
+                float(high_52_close) if high_52_close is not None else None,
+                row.get("high_52w_days_ago"),
+                float(high_all_close) if high_all_close is not None else None,
+                row.get("high_all_days_ago"),
+                row.get("last_5pct_higher_date"),
+                row.get("last_5pct_higher_days_ago"),
                 fmt2(row["beta"]),
                 fmt2(row["beta_pct_5"]),
                 fmt2(row["rsi"]),
@@ -1092,8 +1179,8 @@ def main() -> None:
 
     ws.freeze_panes = "A3"
 
-    last_close_col_idx = data_keys.index("last_close") + 1
-    avg_col_idx = data_keys.index("avg_dollar_volume") + 1
+    currency_keys = ["last_close", "high_52w_close", "high_all_close", "avg_dollar_volume"]
+    currency_col_idxs = [data_keys.index(key) + 1 for key in currency_keys if key in data_keys]
     pct_format_cols = [
         data_keys.index(key) + 1
         for key in [
@@ -1111,6 +1198,13 @@ def main() -> None:
     zebra_fill = PatternFill(fill_type="solid", fgColor="F7F7F7")
     pct_col_idxs = [idx + 1 for idx, key in enumerate(data_keys) if key.endswith("_pct_5")]
     atr_pct_col_idx = data_keys.index("atr_pct") + 1 if "atr_pct" in data_keys else None
+    separator_after_keys = [
+        "high_52w_days_ago",
+        "high_all_days_ago",
+        "last_5pct_higher_days_ago",
+    ]
+    thick_right_cols = {data_keys.index(key) + 1 for key in separator_after_keys if key in data_keys}
+    thick_left_cols = {idx + 1 for idx in thick_right_cols if idx + 1 <= len(data_keys)}
     thin_side = Side(style="thin", color="000000")
     thick_side = Side(style="thick", color="000000")
     vertical_border = Border(left=thin_side, right=thin_side)
@@ -1118,13 +1212,10 @@ def main() -> None:
     next_separator_border = Border(left=thick_side, right=thin_side)
     atr_separator_border = Border(left=thick_side, right=thick_side)
     for row_idx in range(3, ws.max_row + 1):
-        last_close_cell = ws.cell(row=row_idx, column=last_close_col_idx)
-        if last_close_cell.value is not None:
-            last_close_cell.number_format = "$#,##0.00"
-
-        avg_cell = ws.cell(row=row_idx, column=avg_col_idx)
-        if avg_cell.value is not None:
-            avg_cell.number_format = "$#,##0.00"
+        for col_idx in currency_col_idxs:
+            cur_cell = ws.cell(row=row_idx, column=col_idx)
+            if cur_cell.value is not None:
+                cur_cell.number_format = "$#,##0.00"
 
         for col_idx in pct_format_cols:
             pct_cell = ws.cell(row=row_idx, column=col_idx)
@@ -1143,6 +1234,10 @@ def main() -> None:
             if atr_pct_col_idx is not None and col_idx == atr_pct_col_idx:
                 border = atr_separator_border
             elif atr_pct_col_idx is not None and col_idx == atr_pct_col_idx + 1:
+                border = next_separator_border
+            elif col_idx in thick_right_cols:
+                border = separator_border
+            elif col_idx in thick_left_cols:
                 border = next_separator_border
             elif col_idx in pct_col_idxs:
                 if atr_pct_col_idx is not None and col_idx + 1 == atr_pct_col_idx:
