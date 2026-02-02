@@ -16,6 +16,8 @@ Open the PyCharm Terminal and run:
 python -m pip install -r requirements.txt
 ```
 
+Optional (earnings columns): the screener fetches earnings dates from the public Nasdaq earnings calendar API (no API key required).
+
 ## 4) Download Stooq data
 - Download the daily **Stooq data zip** (the file is usually named `data.zip`).
 - Extract it so you have a folder named `data` that contains `daily/`.

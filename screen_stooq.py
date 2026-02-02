@@ -4,12 +4,13 @@ import argparse
 import calendar
 import csv
 import os
-from datetime import date
+from datetime import date, timedelta
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+import requests
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
@@ -327,6 +328,100 @@ def display_symbol(sym: str) -> str:
     if s.upper().endswith(".US"):
         return s[:-3]
     return s
+
+
+NASDAQ_EARNINGS_URL = "https://api.nasdaq.com/api/calendar/earnings"
+NASDAQ_HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "application/json, text/plain, */*",
+    "Referer": "https://www.nasdaq.com/",
+}
+
+
+def _format_mmddyyyy(d: date | None) -> str:
+    if not d:
+        return ""
+    return d.strftime("%m/%d/%Y")
+
+
+def _nasdaq_calendar_rows(
+    day: date,
+    session: requests.Session,
+    cache: dict[date, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    cached = cache.get(day)
+    if cached is not None:
+        return cached
+
+    try:
+        resp = session.get(
+            NASDAQ_EARNINGS_URL,
+            params={"date": day.isoformat()},
+            headers=NASDAQ_HEADERS,
+            timeout=20,
+        )
+        if resp.status_code != 200:
+            cache[day] = []
+            return []
+        payload = resp.json()
+    except Exception:
+        cache[day] = []
+        return []
+
+    data = payload.get("data") if isinstance(payload, dict) else None
+    rows = data.get("rows") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        rows = []
+
+    cache[day] = rows
+    return rows
+
+
+def fetch_nasdaq_earnings_dates(
+    symbols: list[str],
+    session: requests.Session,
+    today: date | None = None,
+    max_days: int = 180,
+) -> dict[str, tuple[str, str]]:
+    today = today or date.today()
+    target = {s.strip().upper() for s in symbols if s and s.strip()}
+    if not target:
+        return {}
+
+    last_dates: dict[str, date] = {}
+    next_dates: dict[str, date] = {}
+    cache: dict[date, list[dict[str, Any]]] = {}
+
+    # Scan forward for next earnings date
+    for offset in range(0, max_days + 1):
+        day = today + timedelta(days=offset)
+        if day.weekday() >= 5:
+            continue
+        rows = _nasdaq_calendar_rows(day, session, cache)
+        for row in rows:
+            sym = str(row.get("symbol", "")).strip().upper()
+            if sym in target and sym not in next_dates:
+                next_dates[sym] = day
+        if len(next_dates) == len(target):
+            break
+
+    # Scan backward for last earnings date
+    for offset in range(0, max_days + 1):
+        day = today - timedelta(days=offset)
+        if day.weekday() >= 5:
+            continue
+        rows = _nasdaq_calendar_rows(day, session, cache)
+        for row in rows:
+            sym = str(row.get("symbol", "")).strip().upper()
+            if sym in target and sym not in last_dates:
+                last_dates[sym] = day
+        if len(last_dates) == len(target):
+            break
+
+    out: dict[str, tuple[str, str]] = {}
+    for sym in target:
+        out[sym] = (_format_mmddyyyy(last_dates.get(sym)), _format_mmddyyyy(next_dates.get(sym)))
+    return out
 
 
 def fmt2(x: Any) -> str:
@@ -785,6 +880,16 @@ def main() -> None:
             if res:
                 results.append(res)
 
+    if results:
+        symbols = [str(row.get("symbol", "")).strip().upper() for row in results]
+        session = requests.Session()
+        earnings_map = fetch_nasdaq_earnings_dates(symbols, session, today=date.today())
+        for row in results:
+            symbol = str(row.get("symbol", "")).strip().upper()
+            last_date, next_date = earnings_map.get(symbol, ("", ""))
+            row["last_earnings_date"] = last_date
+            row["next_earnings_date"] = next_date
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if out_path.suffix.lower() != ".xlsx":
         out_path = out_path.with_suffix(".xlsx")
@@ -805,6 +910,8 @@ def main() -> None:
         "MACD/Signal 5D %",
         "Avg $ Vol",
         "Avg $ Vol 5D %",
+        "Last Earnings",
+        "Next Earnings",
     ]
     data_keys = [
         "symbol",
@@ -822,6 +929,8 @@ def main() -> None:
         "macd_signal_ratio_pct_5",
         "avg_dollar_volume",
         "avg_dollar_volume_pct_5",
+        "last_earnings_date",
+        "next_earnings_date",
     ]
     data_date = date_from_int(int(bd[-1])) if len(bd) else date.today()
     headline = data_date.strftime("%d %b %Y").upper()
@@ -868,6 +977,8 @@ def main() -> None:
         pct_desc,
         avg_desc,
         pct_desc,
+        "MM/DD/YYYY",
+        "MM/DD/YYYY",
     ]
     ws.append(descriptors)
     for row in sorted(results, key=lambda x: str(x["symbol"])):
@@ -889,6 +1000,8 @@ def main() -> None:
                 fmt2(row["macd_signal_ratio_pct_5"]),
                 float(row["avg_dollar_volume"]),
                 fmt2(row["avg_dollar_volume_pct_5"]),
+                row["last_earnings_date"],
+                row["next_earnings_date"],
             ]
         )
 
