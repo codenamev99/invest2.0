@@ -4,7 +4,7 @@ import argparse
 import calendar
 import csv
 import os
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -12,7 +12,7 @@ from typing import Any
 import numpy as np
 import requests
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.styles import Alignment, Border, Color, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 
@@ -1016,31 +1016,31 @@ def main() -> None:
     if out_path.suffix.lower() != ".xlsx":
         out_path = out_path.with_suffix(".xlsx")
 
-    fieldnames = [
-        "Symbol",
-        "Close $",
-        "Close 5D %",
-        "52W High Close",
+    header_row = [
+        None,
+        " Close $",
+        None,
         "52W High",
-        "All-Time High Close",
+        None,
         "All-Time High",
-        "Last 5% Higher",
-        "Last 5% Higher",
+        None,
+        "Last 5% Higher Close",
+        None,
         "Beta",
-        "Beta 5D %",
+        None,
         "RSI",
-        "RSI 5D %",
+        None,
         "ATR %",
         "MACD",
-        "MACD 5D %",
+        None,
         "Signal",
-        "Signal 5D %",
+        None,
         "MACD/Signal",
-        "MACD/Signal 5D %",
+        None,
         "Avg $ Vol",
-        "Avg $ Vol 5D %",
-        "Last Earnings",
-        "Next Earnings",
+        None,
+        "Earnings",
+        None,
     ]
     data_keys = [
         "symbol",
@@ -1083,7 +1083,7 @@ def main() -> None:
     else:
         ws = wb.create_sheet(title=sheet_name)
 
-    ws.append(fieldnames)
+    ws.append(header_row)
 
     if args.beta_freq == "monthly":
         beta_desc = f"{args.beta_months} months\n> {args.beta_min}"
@@ -1095,17 +1095,21 @@ def main() -> None:
     else:
         avg_desc = f"{avg_vol_days} days\n> ${args.avg_dollar_vol_min:,.0f}"
 
-    pct_desc = "5 days %"
-    beta_change_desc = "5 months %" if args.beta_freq == "monthly" else pct_desc
+    pct_change_days = 5
+    pct_change_desc = f"{pct_change_days} days \nchange %"
+    pct_desc = f"{pct_change_days} days %"
+    beta_change_desc = (
+        f"{pct_change_days} months \nchange %" if args.beta_freq == "monthly" else pct_change_desc
+    )
     descriptors = [
-        "",
-        "",
-        pct_desc,
-        "52W high\nClose $",
+        None,
+        None,
+        pct_change_desc,
+        None,
         "Days ago",
-        "All-time high\nClose $",
+        None,
         "Days ago",
-        "MM/DD/YYYY",
+        None,
         "Days ago",
         beta_desc,
         beta_change_desc,
@@ -1120,177 +1124,224 @@ def main() -> None:
         pct_desc,
         avg_desc,
         pct_desc,
-        "MM/DD/YYYY",
-        "MM/DD/YYYY",
+        "Last",
+        "Next",
     ]
     ws.append(descriptors)
+
+    def parse_mmddyyyy(value: Any) -> datetime | None:
+        if not value:
+            return None
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, date):
+            return datetime.combine(value, datetime.min.time())
+        try:
+            return datetime.strptime(str(value), "%m/%d/%Y")
+        except Exception:
+            return None
+
+    def fmt_pct_value(x: Any) -> float | None:
+        if x is None:
+            return None
+        try:
+            if isinstance(x, (float, np.floating)) and not np.isfinite(x):
+                return None
+            return float(f"{float(x):.2f}")
+        except Exception:
+            return None
+
     for row in sorted(results, key=lambda x: str(x["symbol"])):
         high_52_close = row.get("high_52w_close")
         high_all_close = row.get("high_all_close")
-        # Round all numeric fields to 2 decimals (max)
         ws.append(
             [
-                row["symbol"],
+                str(row["symbol"]),
                 float(row["last_close"]),
                 fmt2(row["last_close_pct_5"]),
                 float(high_52_close) if high_52_close is not None else None,
                 row.get("high_52w_days_ago"),
                 float(high_all_close) if high_all_close is not None else None,
                 row.get("high_all_days_ago"),
-                row.get("last_5pct_higher_date"),
+                parse_mmddyyyy(row.get("last_5pct_higher_date")),
                 row.get("last_5pct_higher_days_ago"),
                 fmt2(row["beta"]),
-                fmt2(row["beta_pct_5"]),
+                fmt_pct_value(row["beta_pct_5"]),
                 fmt2(row["rsi"]),
-                fmt2(row["rsi_pct_5"]),
-                fmt2(row["atr_pct"]),
+                fmt_pct_value(row["rsi_pct_5"]),
+                fmt_pct_value(row["atr_pct"]),
                 fmt2(row["macd"]),
-                fmt2(row["macd_pct_5"]),
+                fmt_pct_value(row["macd_pct_5"]),
                 fmt2(row["signal"]),
-                fmt2(row["signal_pct_5"]),
+                fmt_pct_value(row["signal_pct_5"]),
                 fmt2(row["macd_signal_ratio"]),
-                fmt2(row["macd_signal_ratio_pct_5"]),
+                fmt_pct_value(row["macd_signal_ratio_pct_5"]),
                 float(row["avg_dollar_volume"]),
-                fmt2(row["avg_dollar_volume_pct_5"]),
-                row["last_earnings_date"],
-                row["next_earnings_date"],
+                fmt_pct_value(row["avg_dollar_volume_pct_5"]),
+                parse_mmddyyyy(row.get("last_earnings_date")),
+                parse_mmddyyyy(row.get("next_earnings_date")),
             ]
         )
 
-    if ws.max_row > 1:
-        is_row1_empty = all(cell.value is None for cell in ws[1])
-        if is_row1_empty:
-            ws.delete_rows(1, 1)
+    black = Color(indexed=8)
+    white = Color(indexed=9)
+    red = Color(indexed=10)
+    blue = Color(indexed=12)
+    yellow = Color(indexed=13)
 
-    header_fill = PatternFill(fill_type="solid", fgColor="000000")
-    header_font = Font(bold=True, color="FFFFFF", size=13)
-    ws.row_dimensions[1].height = 26
-    for cell in ws[1]:
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="center", vertical="center")
+    header_fill = PatternFill(fill_type="solid", fgColor=black)
+    descriptor_fill = PatternFill(fill_type="solid", fgColor=blue)
+    white_fill = PatternFill(fill_type="solid", fgColor=white)
+    black_fill = PatternFill(fill_type="solid", fgColor=black)
 
-    descriptor_fill = PatternFill(fill_type="solid", fgColor="D9D9D9")
-    descriptor_font = Font(italic=True, color="000000", size=11)
-    for cell in ws[2]:
-        cell.font = descriptor_font
-        cell.fill = descriptor_fill
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    header_font = Font(name="Calibri", size=13, bold=True, color=white)
+    descriptor_font = Font(name="Calibri", size=11, bold=True, italic=True, color=black)
+    symbol_font = Font(name="Calibri", size=13, bold=True, color=white)
+    bold_font = Font(name="Calibri", size=11, bold=True, color=black)
 
-    ws.freeze_panes = "B3"
+    header_align = Alignment(horizontal="center", vertical="center")
+    descriptor_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    left_center_align = Alignment(horizontal="left", vertical="center")
+    center_bottom_align = Alignment(horizontal="center", vertical="bottom")
+    bottom_align = Alignment(vertical="bottom")
 
-    currency_keys = ["last_close", "high_52w_close", "high_all_close", "avg_dollar_volume"]
-    currency_col_idxs = [data_keys.index(key) + 1 for key in currency_keys if key in data_keys]
-    pct_format_cols = [
-        data_keys.index(key) + 1
-        for key in [
-            "last_close_pct_5",
-            "beta_pct_5",
-            "rsi_pct_5",
-            "atr_pct",
-            "macd_pct_5",
-            "signal_pct_5",
-            "macd_signal_ratio_pct_5",
-        ]
-        if key in data_keys
-    ]
-    base_row_height = ws.sheet_format.defaultRowHeight or 15
-    group_fills = [
-        PatternFill(fill_type="solid", fgColor="F7F7F7"),
-        PatternFill(fill_type="solid", fgColor="FFFFFF"),
-    ]
-    pct_col_idxs = [idx + 1 for idx, key in enumerate(data_keys) if key.endswith("_pct_5")]
-    atr_pct_col_idx = data_keys.index("atr_pct") + 1 if "atr_pct" in data_keys else None
-    separator_after_keys = [
-        "high_52w_days_ago",
-        "high_all_days_ago",
-        "last_5pct_higher_days_ago",
-    ]
-    thick_right_cols = {data_keys.index(key) + 1 for key in separator_after_keys if key in data_keys}
-    thick_left_cols = {idx + 1 for idx in thick_right_cols if idx + 1 <= len(data_keys)}
-    thin_side = Side(style="thin", color="000000")
-    thick_side = Side(style="thick", color="000000")
-    vertical_border = Border(left=thin_side, right=thin_side)
-    separator_border = Border(left=thin_side, right=thick_side)
-    next_separator_border = Border(left=thick_side, right=thin_side)
-    atr_separator_border = Border(left=thick_side, right=thick_side)
-    group_key_sets = [
-        ["last_close", "last_close_pct_5"],
-        ["high_52w_close", "high_52w_days_ago"],
-        ["high_all_close", "high_all_days_ago"],
-        ["last_5pct_higher_date", "last_5pct_higher_days_ago"],
-        ["beta", "beta_pct_5"],
-        ["rsi", "rsi_pct_5"],
-        ["atr_pct"],
-        [
-            "macd",
-            "macd_pct_5",
-            "signal",
-            "signal_pct_5",
-            "macd_signal_ratio",
-            "macd_signal_ratio_pct_5",
-        ],
-        ["avg_dollar_volume", "avg_dollar_volume_pct_5"],
-        ["last_earnings_date", "next_earnings_date"],
-    ]
-    for group_idx, group_keys in enumerate(group_key_sets):
-        fill = group_fills[group_idx % len(group_fills)]
-        for key in group_keys:
-            if key not in data_keys:
-                continue
-            col_idx = data_keys.index(key) + 1
-            ws.cell(row=2, column=col_idx).fill = fill
+    thin_red = Side(style="thin", color=red)
+    thin_black = Side(style="thin", color=black)
+    thick_black = Side(style="thick", color=black)
+
+    header_style_cols = {1, 2, 4, 6, 8, 10, 12, 14, 15, 17, 19, 21, 23}
+    header_value_cols = {2, 4, 6, 8, 10, 12, 14, 15, 17, 19, 21, 23}
+    left_thick_cols = {4, 6, 8, 10, 12, 14, 15, 17, 19, 21, 23}
+    right_thick_cols = {3, 5, 7, 9, 11, 13, 14, 16, 18, 20, 22, 24}
+
+    # Column widths from the sample spreadsheet
+    column_widths = {
+        1: 8.0,
+        2: 9.0,
+        3: 12.0,
+        4: 13.5,
+        5: 8.44531,
+        6: 13.1562,
+        7: 9.39844,
+        8: 10.6641,
+        9: 13.0,
+        10: 10.0,
+        11: 11.0,
+        12: 14.0,
+        13: 10.0,
+        14: 17.0,
+        15: 15.0,
+        16: 11.0,
+        17: 9.0,
+        18: 13.0,
+        19: 12.2812,
+        20: 14.7578,
+        21: 15.6797,
+        22: 12.5312,
+        23: 14.2734,
+        24: 13.0,
+    }
+    for col_idx, width in column_widths.items():
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+    ws.row_dimensions[1].height = 50.85
+    ws.row_dimensions[2].height = 34.85
     for row_idx in range(3, ws.max_row + 1):
-        for col_idx in (5, 7, 9):  # E, G, I
-            cell = ws.cell(row=row_idx, column=col_idx)
-            cell.alignment = Alignment(horizontal="left", vertical="center")
+        ws.row_dimensions[row_idx].height = 17.0
 
-        for col_idx in currency_col_idxs:
-            cur_cell = ws.cell(row=row_idx, column=col_idx)
-            if cur_cell.value is not None:
-                cur_cell.number_format = "$#,##0.00"
+    for col_idx in range(1, ws.max_column + 1):
+        cell = ws.cell(row=1, column=col_idx)
+        if col_idx in header_style_cols:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = header_align
+        if col_idx in header_value_cols:
+            cell.number_format = "@"
+        cell.border = Border(
+            left=thin_red if col_idx == 1 else None,
+            right=thin_red if col_idx in (23, 24) else None,
+            top=thin_red,
+        )
 
-        for col_idx in pct_format_cols:
-            pct_cell = ws.cell(row=row_idx, column=col_idx)
-            if pct_cell.value is not None:
-                pct_cell.number_format = '0.0"%"'
+    for col_idx in range(1, ws.max_column + 1):
+        cell = ws.cell(row=2, column=col_idx)
+        cell.fill = white_fill
+        cell.font = descriptor_font
+        cell.alignment = descriptor_align
+        if cell.value is not None:
+            cell.number_format = "@"
+        cell.border = Border(
+            left=thin_red if col_idx == 1 else (thick_black if col_idx in left_thick_cols else None),
+            right=thick_black if col_idx in right_thick_cols else None,
+        )
 
-        first_col_cell = ws.cell(row=row_idx, column=1)
-        first_col_cell.font = Font(color="FFFFFF", size=11)
-        first_col_cell.fill = header_fill
+    bold_cols = {2, 4, 6}
+    left_center_cols = {5, 7, 9}
+    center_bottom_cols = {15, 17, 19}
+    number_formats = {
+        1: "@",
+        2: '"$"#,##0.00',
+        3: "@",
+        4: '"$"#,##0.00',
+        5: "General",
+        6: '"$"#,##0.00',
+        7: "General",
+        8: "mmm d, yyyy",
+        9: "General",
+        10: "@",
+        11: "0%",
+        12: "@",
+        13: "0%",
+        14: "0%",
+        15: "@",
+        16: "0%",
+        17: "@",
+        18: "0%",
+        19: "@",
+        20: "0%",
+        21: '"$"#,##0.00',
+        22: "0%",
+        23: "mmm d, yyyy",
+        24: "mmm d, yyyy",
+    }
 
-        for group_idx, group_keys in enumerate(group_key_sets):
-            fill = group_fills[group_idx % len(group_fills)]
-            for key in group_keys:
-                if key not in data_keys:
-                    continue
-                col_idx = data_keys.index(key) + 1
-                ws.cell(row=row_idx, column=col_idx).fill = fill
-
+    for row_idx in range(3, ws.max_row + 1):
         for col_idx in range(1, ws.max_column + 1):
-            if atr_pct_col_idx is not None and col_idx == atr_pct_col_idx:
-                border = atr_separator_border
-            elif atr_pct_col_idx is not None and col_idx == atr_pct_col_idx + 1:
-                border = next_separator_border
-            elif col_idx in thick_right_cols:
-                border = separator_border
-            elif col_idx in thick_left_cols:
-                border = next_separator_border
-            elif col_idx in pct_col_idxs:
-                if atr_pct_col_idx is not None and col_idx + 1 == atr_pct_col_idx:
-                    border = separator_border
-                else:
-                    border = separator_border
-            elif (col_idx - 1) in pct_col_idxs:
-                border = next_separator_border
+            cell = ws.cell(row=row_idx, column=col_idx)
+            cell.fill = black_fill if col_idx == 1 else white_fill
+            if col_idx == 1:
+                cell.font = symbol_font
+            elif col_idx in bold_cols:
+                cell.font = bold_font
+            if col_idx in left_center_cols:
+                cell.alignment = left_center_align
+            elif col_idx in center_bottom_cols:
+                cell.alignment = center_bottom_align
             else:
-                border = vertical_border
-            ws.cell(row=row_idx, column=col_idx).border = border
+                cell.alignment = bottom_align
+            if col_idx in number_formats:
+                cell.number_format = number_formats[col_idx]
+            cell.border = Border(
+                left=thick_black if col_idx in left_thick_cols else thin_black,
+                right=thick_black if col_idx in right_thick_cols else thin_black,
+            )
 
-        current_height = ws.row_dimensions[row_idx].height or base_row_height
-        ws.row_dimensions[row_idx].height = current_height + 2
+    for start_col, end_col in [
+        (2, 3),
+        (4, 5),
+        (6, 7),
+        (8, 9),
+        (10, 11),
+        (12, 13),
+        (15, 16),
+        (17, 18),
+        (19, 20),
+        (21, 22),
+        (23, 24),
+    ]:
+        ws.merge_cells(start_row=1, start_column=start_col, end_row=1, end_column=end_col)
 
-    auto_size_columns(ws)
+    ws.freeze_panes = None
 
     wb.save(out_path)
 
