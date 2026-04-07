@@ -19,27 +19,35 @@ python -m pip install -r requirements.txt
 Optional (earnings columns): the screener fetches earnings dates from the public Nasdaq earnings calendar API (no API key required).
 
 ## 4) Download Stooq data
-- Download the daily **Stooq data zip** (the file is usually named `data.zip`).
-- Extract it so you have a folder named `data` that contains `daily/`.
-  - Example: `C:\Users\you\Downloads\data\daily\...`
+- On **Windows**, the US daily text bundle from Stooq is typically **`d_us_txt.zip`** (folder after extract: **`d_us_txt`**, containing `daily/`).
+- You can point `STOOQ_SRC` at either the **zip** or the **extracted folder**.
+  - Example folder: `C:\Users\you\Downloads\d_us_txt\daily\...`
+  - Example zip: `C:\Users\you\Downloads\d_us_txt.zip`
 
 ## 5) Set the Stooq download location (important)
-Open `run_daily.bat` and update the configuration block near the top:
+Open `run_daily.bat` and update the configuration block near the top. By default `STOOQ_SRC` is **empty** (refresh skipped) until you set it.
+
+**Do not use Mac paths like `/Users/yourname/...` on Windows** — Python may turn that into `C:\Users\yourname\...`, which is wrong if that user folder does not exist on this PC.
+
+Use a real path to **`d_us_txt`** (extracted) or **`d_us_txt.zip`**:
 ```
-set "STOOQ_SRC=/Users/v/Downloads/data"
-set "STOOQ_MODE=move"
+set "STOOQ_SRC=C:\Users\you\Downloads\d_us_txt"
+```
+or:
+```
+set "STOOQ_SRC=C:\Users\you\Downloads\d_us_txt.zip"
+```
+
+Other variables:
+```
+set "STOOQ_MODE=copy"
 set "DATA_DEST=%PROJECT_DIR%data 2"
 set "ROOT_DATA=%PROJECT_DIR%data 2\daily\us"
 ```
 
-Change `STOOQ_SRC` to **where your Stooq download folder lives** on Windows:
-```
-set "STOOQ_SRC=C:\Users\you\Downloads\data"
-```
-
 `STOOQ_MODE` controls cleanup behavior:
-- `move` will move the `data` folder into the project (removes it from Downloads).
-- `copy` keeps the source intact.
+- `move` moves the Stooq data into the project (removes it from the source location).
+- `copy` keeps the source zip/folder intact (recommended).
 
 Optional: if you want the project to store the data somewhere else, update both:
 - `DATA_DEST` (where the project will keep the data copy), and
@@ -57,10 +65,11 @@ set "STOOQ_SRC="
 ```
 
 ## 6) Run the daily job
-From the PyCharm Terminal:
+From the PyCharm Terminal (project root). In **PowerShell** use:
 ```
-run_daily.bat
+.\run_daily.bat
 ```
+In **cmd.exe**, `run_daily.bat` also works.
 
 This will:
 - Copy/refresh the Stooq data into the project

@@ -129,7 +129,7 @@ def main() -> None:
         "--src", "--zip",
         dest="src",
         default="",
-        help='Source Stooq download (FOLDER like "/Users/v/Downloads/data" OR ZIP file)'
+        help='Source Stooq bundle (folder with daily/, e.g. d_us_txt OR .zip like d_us_txt.zip)'
     )
 
     ap.add_argument("--downloads", default="~/Downloads", help="Folder to search if --src/--zip is not provided")
@@ -155,7 +155,14 @@ def main() -> None:
     if args.src:
         src_path = resolve_path(args.src)
         if not src_path.exists():
-            raise FileNotFoundError(src_path)
+            hint = ""
+            s = str(src_path)
+            if args.src.strip().startswith("/Users/") or "\\Users\\" in s:
+                hint = (
+                    " On Windows, a path like /Users/you/... can become C:\\Users\\you\\..."
+                    " — use the real folder or zip on this PC (e.g. C:\\Users\\yourname\\Downloads\\data)."
+                )
+            raise FileNotFoundError(f"Source path does not exist: {src_path}.{hint}")
     else:
         downloads = resolve_path(args.downloads)
         src_path = newest_matching(downloads, args.pattern, args.min_size_mb)
