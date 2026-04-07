@@ -24,6 +24,7 @@ rem Stooq US daily (txt) on Windows is usually named d_us_txt (.zip) or extracte
 rem Set STOOQ_SRC to that folder or zip, e.g. C:\Users\YourName\Downloads\d_us_txt  or  ...\d_us_txt.zip
 rem Use a real Windows path — NOT /Users/... (Python maps that to C:\Users\... and breaks if that user does not exist).
 rem Leave empty to skip refresh (you must already have data under DATA_DEST, see below).
+rem Example: set "STOOQ_SRC=C:\Users\YourName\Downloads\d_us_txt"
 set "STOOQ_SRC="
 set "STOOQ_MODE=copy"
 set "DATA_DEST=%PROJECT_DIR%data 2"
@@ -48,7 +49,8 @@ if exist "requirements.txt" (
     if errorlevel 1 exit /b 1
 )
 
-if not exist "%ROOT_DATA%\nyse stocks\" (
+rem No trailing \ before " — that breaks CMD parsing (escaped quote).
+if not exist "%ROOT_DATA%\nyse stocks" (
     echo ERROR: NYSE data folder not found:
     echo   "%ROOT_DATA%\nyse stocks"
     echo Download/extract Stooq US daily data and set STOOQ_SRC, or place files under the path above.
