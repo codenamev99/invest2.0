@@ -6,8 +6,9 @@ set "PROJECT_DIR=%~dp0"
 cd /d "%PROJECT_DIR%"
 
 rem Pick Python command: prefer py -3 on Windows
+rem Use "if not errorlevel 1" — NOT "if %%errorlevel%%==0" (can parse as "if ==0" and break)
 where py >nul 2>nul
-if %errorlevel%==0 (
+if not errorlevel 1 (
     set "PYTHON_CMD=py -3"
 ) else (
     set "PYTHON_CMD=python"
@@ -19,7 +20,7 @@ if exist ".venv\Scripts\activate.bat" (
 )
 
 rem -------- Configuration --------
-rem Set this to your Stooq download path if you want auto refresh
+rem Set this to your Stooq download path if you want auto refresh (use Windows paths, e.g. C:\Users\you\Downloads\data)
 set "STOOQ_SRC=/Users/v/Downloads/data"
 set "STOOQ_MODE=move"
 set "DATA_DEST=%PROJECT_DIR%data 2"
