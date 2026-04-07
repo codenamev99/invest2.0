@@ -4,6 +4,7 @@ import argparse
 import calendar
 import csv
 import os
+from bisect import bisect_left, bisect_right
 from datetime import date, datetime, timedelta
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
@@ -364,6 +365,33 @@ def display_symbol(sym: str) -> str:
     return s
 
 
+def normalize_symbol(sym: str) -> str:
+    s = sym.strip().upper()
+    if not s:
+        return s
+    if not s.endswith(".US"):
+        s = f"{s}.US"
+    return s
+
+
+def prompt_run_mode() -> tuple[str, str | None]:
+    print("Run mode menu:")
+    print("1) All tickers")
+    print("2) Specific ticker")
+    while True:
+        choice = input("Select option (1/2): ").strip()
+        if choice in ("1", "2"):
+            break
+        print("Please enter 1 or 2.")
+    if choice == "2":
+        while True:
+            ticker = input("Enter ticker symbol (e.g., AAPL or AAPL.US): ").strip()
+            if ticker:
+                return "single", normalize_symbol(ticker)
+            print("Ticker cannot be empty.")
+    return "all", None
+
+
 NASDAQ_EARNINGS_URL = "https://api.nasdaq.com/api/calendar/earnings"
 NASDAQ_HEADERS = {
     "User-Agent": "Mozilla/5.0",
@@ -411,12 +439,23 @@ def _nasdaq_calendar_rows(
     return rows
 
 
+def _extract_company_name(row: dict[str, Any]) -> str:
+    name = (
+        row.get("companyName")
+        or row.get("company")
+        or row.get("company_name")
+        or row.get("name")
+        or ""
+    )
+    return str(name).strip()
+
+
 def fetch_nasdaq_earnings_dates(
     symbols: list[str],
     session: requests.Session,
     today: date | None = None,
     max_days: int = 180,
-) -> dict[str, tuple[str, str]]:
+) -> dict[str, dict[str, str]]:
     today = today or date.today()
     target = {s.strip().upper() for s in symbols if s and s.strip()}
     if not target:
@@ -424,6 +463,7 @@ def fetch_nasdaq_earnings_dates(
 
     last_dates: dict[str, date] = {}
     next_dates: dict[str, date] = {}
+    company_names: dict[str, str] = {}
     cache: dict[date, list[dict[str, Any]]] = {}
 
     # Scan forward for next earnings date
@@ -436,6 +476,10 @@ def fetch_nasdaq_earnings_dates(
             sym = str(row.get("symbol", "")).strip().upper()
             if sym in target and sym not in next_dates:
                 next_dates[sym] = day
+            if sym in target and sym not in company_names:
+                name = _extract_company_name(row)
+                if name:
+                    company_names[sym] = name
         if len(next_dates) == len(target):
             break
 
@@ -449,12 +493,20 @@ def fetch_nasdaq_earnings_dates(
             sym = str(row.get("symbol", "")).strip().upper()
             if sym in target and sym not in last_dates:
                 last_dates[sym] = day
+            if sym in target and sym not in company_names:
+                name = _extract_company_name(row)
+                if name:
+                    company_names[sym] = name
         if len(last_dates) == len(target):
             break
 
-    out: dict[str, tuple[str, str]] = {}
+    out: dict[str, dict[str, str]] = {}
     for sym in target:
-        out[sym] = (_format_mmddyyyy(last_dates.get(sym)), _format_mmddyyyy(next_dates.get(sym)))
+        out[sym] = {
+            "last": _format_mmddyyyy(last_dates.get(sym)),
+            "next": _format_mmddyyyy(next_dates.get(sym)),
+            "name": company_names.get(sym, ""),
+        }
     return out
 
 
@@ -560,6 +612,67 @@ def is_empty_sheet(ws) -> bool:
     return ws.max_row == 1 and ws.max_column == 1 and ws["A1"].value is None
 
 
+def append_single_ticker_section(
+    ws,
+    heading: str,
+    header_row: list[Any],
+    descriptors: list[Any],
+    data_row: list[Any],
+) -> None:
+    if not is_empty_sheet(ws):
+        ws.append([])
+
+    ws.append([heading])
+    heading_row = ws.max_row
+    ws.merge_cells(start_row=heading_row, start_column=1, end_row=heading_row, end_column=len(header_row))
+    heading_cell = ws.cell(row=heading_row, column=1)
+    heading_cell.font = Font(name="Calibri", size=12, bold=True)
+    heading_cell.alignment = Alignment(horizontal="left", vertical="center")
+
+    ws.append([h if h is not None else "" for h in header_row])
+    ws.append([d if d is not None else "" for d in descriptors])
+    ws.append(data_row)
+
+    header_row_idx = heading_row + 1
+    descriptor_row_idx = heading_row + 2
+    for col_idx in range(1, len(header_row) + 1):
+        cell = ws.cell(row=header_row_idx, column=col_idx)
+        cell.font = Font(name="Calibri", size=11, bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    for col_idx in range(1, len(descriptors) + 1):
+        cell = ws.cell(row=descriptor_row_idx, column=col_idx)
+        cell.font = Font(name="Calibri", size=10, italic=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+
+def count_recent_symbol_occurrences(wb: Workbook, max_runs: int = 5) -> dict[str, int]:
+    """
+    Count how many of the last N sheets each symbol appeared in.
+    """
+    if max_runs <= 0 or not wb.sheetnames:
+        return {}
+
+    recent_names = wb.sheetnames[-max_runs:]
+    counts: dict[str, int] = {}
+    for name in recent_names:
+        if name == "Single Tickers":
+            continue
+        ws = wb[name]
+        if is_empty_sheet(ws):
+            continue
+        symbols_in_sheet: set[str] = set()
+        for (val,) in ws.iter_rows(min_row=3, max_row=ws.max_row, min_col=1, max_col=1, values_only=True):
+            if val is None:
+                continue
+            sym = str(val).strip().upper()
+            if sym:
+                symbols_in_sheet.add(sym)
+        for sym in symbols_in_sheet:
+            counts[sym] = counts.get(sym, 0) + 1
+
+    return counts
+
+
 def auto_size_columns(ws, min_width: int = 8, max_width: int = 40) -> None:
     """
     Auto-size worksheet column widths based on cell contents.
@@ -600,13 +713,16 @@ def screen_symbol(
     params: dict[str, Any],
     bench_map: dict[int, float],
     need_rows: int,
+    apply_filters: bool = True,
 ) -> dict[str, Any] | None:
     d, c, v, h, l = load_series_from_file(path, need_rows=need_rows)
+    if len(d) == 0:
+        return None
     min_rows = 60
     if params["avg_vol_mode"] == "days":
         min_rows = max(params["avg_vol_days"] + 1, min_rows)
     min_rows = max(min_rows, params["rsi_period"] + 2, params["atr_period"] + 2)
-    if len(d) < min_rows:
+    if apply_filters and len(d) < min_rows:
         return None
 
     change_lookback = 5  # trading periods
@@ -617,19 +733,27 @@ def screen_symbol(
         last_date = date_from_int(int(d[-1]))
         cutoff_date = shift_months(last_date, -int(params["avg_vol_months"]))
         cutoff_int = date_to_int(cutoff_date)
-        if d[0] > cutoff_int:
+        if apply_filters and d[0] > cutoff_int:
             return None
         mask = d >= cutoff_int
-        if not np.any(mask):
+        if apply_filters and not np.any(mask):
             return None
-        close_window = c[mask]
-        vol_window = v[mask]
+        if np.any(mask):
+            close_window = c[mask]
+            vol_window = v[mask]
+        else:
+            close_window = c
+            vol_window = v
     else:
-        close_window = c[-params["avg_vol_days"]:]
-        vol_window = v[-params["avg_vol_days"]:]
+        if params["avg_vol_days"] > 0:
+            close_window = c[-params["avg_vol_days"]:]
+            vol_window = v[-params["avg_vol_days"]:]
+        else:
+            close_window = c
+            vol_window = v
 
-    avg_dollar_volume = float(np.mean(close_window * vol_window))
-    if avg_dollar_volume <= params["avg_dollar_vol_min"]:
+    avg_dollar_volume = float(np.mean(close_window * vol_window)) if len(close_window) else np.nan
+    if apply_filters and (not np.isfinite(avg_dollar_volume) or avg_dollar_volume <= params["avg_dollar_vol_min"]):
         return None
 
     avg_dollar_volume_prev = np.nan
@@ -664,7 +788,7 @@ def screen_symbol(
     rsi_vals = rsi_wilder(c, period=params["rsi_period"])
     last_rsi = float(rsi_vals[-1])
     prev_rsi = float(rsi_vals[prev_idx]) if len(rsi_vals) >= change_lookback + 1 else np.nan
-    if not (params["rsi_low"] <= last_rsi <= params["rsi_high"]):
+    if apply_filters and not (params["rsi_low"] <= last_rsi <= params["rsi_high"]):
         return None
 
     # ATR filter (percent of last close)
@@ -673,7 +797,7 @@ def screen_symbol(
     atr_pct = np.nan
     if np.isfinite(last_atr) and last_close > 0:
         atr_pct = (last_atr / last_close) * 100.0
-    if not np.isfinite(atr_pct) or atr_pct <= params["atr_min_pct"]:
+    if apply_filters and (not np.isfinite(atr_pct) or atr_pct <= params["atr_min_pct"]):
         return None
 
     # MACD filter
@@ -682,7 +806,7 @@ def screen_symbol(
     last_sig = float(sig_line[-1])
     prev_macd = float(macd_line[prev_idx]) if len(macd_line) >= change_lookback + 1 else np.nan
     prev_sig = float(sig_line[prev_idx]) if len(sig_line) >= change_lookback + 1 else np.nan
-    if not (last_macd > last_sig):
+    if apply_filters and not (last_macd > last_sig):
         return None
 
     macd_signal_ratio = np.nan
@@ -692,34 +816,39 @@ def screen_symbol(
     if np.isfinite(prev_macd) and np.isfinite(prev_sig) and prev_sig != 0:
         macd_signal_ratio_prev = prev_macd / prev_sig
 
+    stock_close_aligned = np.array([], dtype=float)
+    bench_close_aligned = np.array([], dtype=float)
+    beta_prev = np.nan
+
     if params["beta_freq"] == "monthly":
         sm, smc = monthly_closes(d, c)
         if len(sm) < params["beta_months"] + 1:
-            return None
+            if apply_filters:
+                return None
+        else:
+            stock_aligned: list[float] = []
+            bench_aligned: list[float] = []
+            for mk, ci in zip(sm, smc):
+                bench_ci = bench_map.get(int(mk))
+                if bench_ci is None:
+                    continue
+                stock_aligned.append(float(ci))
+                bench_aligned.append(float(bench_ci))
 
-        stock_aligned: list[float] = []
-        bench_aligned: list[float] = []
-        for mk, ci in zip(sm, smc):
-            bench_ci = bench_map.get(int(mk))
-            if bench_ci is None:
-                continue
-            stock_aligned.append(float(ci))
-            bench_aligned.append(float(bench_ci))
-
-        if len(stock_aligned) < params["beta_months"] + 1:
-            return None
-
-        stock_close_aligned = np.array(stock_aligned[-(params["beta_months"] + 1):], dtype=float)
-        bench_close_aligned = np.array(bench_aligned[-(params["beta_months"] + 1):], dtype=float)
-        beta_prev = np.nan
-        if len(stock_aligned) >= params["beta_months"] + 1 + change_lookback:
-            prev_stock = np.array(stock_aligned[:-change_lookback], dtype=float)
-            prev_bench = np.array(bench_aligned[:-change_lookback], dtype=float)
-            if len(prev_stock) >= params["beta_months"] + 1:
-                beta_prev = beta_from_aligned_closes(
-                    prev_stock[-(params["beta_months"] + 1):],
-                    prev_bench[-(params["beta_months"] + 1):],
-                )
+            if len(stock_aligned) < params["beta_months"] + 1:
+                if apply_filters:
+                    return None
+            else:
+                stock_close_aligned = np.array(stock_aligned[-(params["beta_months"] + 1):], dtype=float)
+                bench_close_aligned = np.array(bench_aligned[-(params["beta_months"] + 1):], dtype=float)
+                if len(stock_aligned) >= params["beta_months"] + 1 + change_lookback:
+                    prev_stock = np.array(stock_aligned[:-change_lookback], dtype=float)
+                    prev_bench = np.array(bench_aligned[:-change_lookback], dtype=float)
+                    if len(prev_stock) >= params["beta_months"] + 1:
+                        beta_prev = beta_from_aligned_closes(
+                            prev_stock[-(params["beta_months"] + 1):],
+                            prev_bench[-(params["beta_months"] + 1):],
+                        )
     else:
         # Align stock closes to benchmark dates for beta (no dict/sort needed)
         stock_aligned = []
@@ -732,22 +861,22 @@ def screen_symbol(
             bench_aligned.append(float(bench_ci))
 
         if len(stock_aligned) < params["beta_lookback"] + 1:
-            return None
-
-        stock_close_aligned = np.array(stock_aligned[-(params["beta_lookback"] + 1):], dtype=float)
-        bench_close_aligned = np.array(bench_aligned[-(params["beta_lookback"] + 1):], dtype=float)
-        beta_prev = np.nan
-        if len(stock_aligned) >= params["beta_lookback"] + 1 + change_lookback:
-            prev_stock = np.array(stock_aligned[:-change_lookback], dtype=float)
-            prev_bench = np.array(bench_aligned[:-change_lookback], dtype=float)
-            if len(prev_stock) >= params["beta_lookback"] + 1:
-                beta_prev = beta_from_aligned_closes(
-                    prev_stock[-(params["beta_lookback"] + 1):],
-                    prev_bench[-(params["beta_lookback"] + 1):],
-                )
+            if apply_filters:
+                return None
+        else:
+            stock_close_aligned = np.array(stock_aligned[-(params["beta_lookback"] + 1):], dtype=float)
+            bench_close_aligned = np.array(bench_aligned[-(params["beta_lookback"] + 1):], dtype=float)
+            if len(stock_aligned) >= params["beta_lookback"] + 1 + change_lookback:
+                prev_stock = np.array(stock_aligned[:-change_lookback], dtype=float)
+                prev_bench = np.array(bench_aligned[:-change_lookback], dtype=float)
+                if len(prev_stock) >= params["beta_lookback"] + 1:
+                    beta_prev = beta_from_aligned_closes(
+                        prev_stock[-(params["beta_lookback"] + 1):],
+                        prev_bench[-(params["beta_lookback"] + 1):],
+                    )
 
     b = beta_from_aligned_closes(stock_close_aligned, bench_close_aligned)
-    if not np.isfinite(b) or b <= params["beta_min"]:
+    if apply_filters and (not np.isfinite(b) or b <= params["beta_min"]):
         return None
 
     close_pct_5 = pct_change(last_close, prev_close)
@@ -795,7 +924,7 @@ def _screen_symbol_worker(task: tuple[str, Path]) -> dict[str, Any] | None:
 # -----------------------------
 def main() -> None:
     ap = argparse.ArgumentParser()
-    tickers_group = ap.add_mutually_exclusive_group(required=True)
+    tickers_group = ap.add_mutually_exclusive_group(required=False)
     tickers_group.add_argument("--tickers", help="CSV with tickers (column: symbol or ticker)")
     tickers_group.add_argument(
         "--tickers_dir",
@@ -873,6 +1002,18 @@ def main() -> None:
         default=5_000_000.0,
         help="Minimum average daily $ volume over avg volume window (close * volume). Default: 5,000,000",
     )
+    ap.add_argument(
+        "--top_n",
+        type=int,
+        default=10,
+        help="Number of top-ranked rows to flag (default: 10)",
+    )
+    ap.add_argument(
+        "--score_enable",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable Top-N scoring and ranking columns (default: True)",
+    )
 
     args = ap.parse_args()
 
@@ -885,25 +1026,41 @@ def main() -> None:
     if args.atr_min_pct < 0:
         raise SystemExit("--atr_min_pct must be >= 0")
 
+    run_mode, single_symbol = prompt_run_mode()
+
     root = resolve_path(args.root)
     out_path = resolve_path(args.out)
 
-    if args.tickers:
-        tickers_path = resolve_path(args.tickers)
-        tickers = load_tickers_csv(tickers_path)
-        symbol_paths = build_file_map(root)
+    tickers: list[str] = []
+    symbol_paths: dict[str, Path] = {}
+    single_path: Path | None = None
+
+    if run_mode == "all":
+        if not args.tickers and not args.tickers_dir:
+            raise SystemExit("Provide --tickers or --tickers_dir for All tickers mode.")
+        if args.tickers:
+            tickers_path = resolve_path(args.tickers)
+            tickers = load_tickers_csv(tickers_path)
+            symbol_paths = build_file_map(root)
+        else:
+            tickers_root = resolve_path(args.tickers_dir)
+            symbol_paths = build_file_map(tickers_root)
+            tickers = sorted(symbol_paths.keys())
     else:
-        tickers_root = resolve_path(args.tickers_dir)
-        symbol_paths = build_file_map(tickers_root)
-        tickers = sorted(symbol_paths.keys())
+        if not single_symbol:
+            raise SystemExit("Single ticker selection required.")
 
-    bench_sym = args.benchmark.strip().upper()
-    if not bench_sym.endswith(".US"):
-        bench_sym += ".US"
+    bench_sym = normalize_symbol(args.benchmark)
 
-    bench_path = symbol_paths.get(bench_sym)
-    if bench_path is None:
+    bench_path = None
+    if run_mode == "all":
+        bench_path = symbol_paths.get(bench_sym)
+        if bench_path is None:
+            bench_path = find_symbol_file(root, bench_sym)
+    else:
         bench_path = find_symbol_file(root, bench_sym)
+        if bench_path is None and args.tickers_dir:
+            bench_path = find_symbol_file(resolve_path(args.tickers_dir), bench_sym)
 
     if bench_path is None:
         raise SystemExit(
@@ -956,11 +1113,19 @@ def main() -> None:
         bench_map = {int(di): float(ci) for di, ci in zip(bd, bc)}
 
     tasks: list[tuple[str, Path]] = []
-    for sym in tickers:
-        p = symbol_paths.get(sym)
-        if not p:
-            continue
-        tasks.append((sym, p))
+    if run_mode == "all":
+        for sym in tickers:
+            p = symbol_paths.get(sym)
+            if not p:
+                continue
+            tasks.append((sym, p))
+    else:
+        single_path = find_symbol_file(root, single_symbol)
+        if single_path is None and args.tickers_dir:
+            single_path = find_symbol_file(resolve_path(args.tickers_dir), single_symbol)
+        if single_path is None:
+            raise SystemExit(f"Ticker {single_symbol} not found under {root}.")
+        tasks.append((single_symbol, single_path))
 
     params = {
         "beta_freq": args.beta_freq,
@@ -986,21 +1151,29 @@ def main() -> None:
     workers = min(workers, len(tasks)) if tasks else 1
 
     results: list[dict[str, Any]] = []
-    if workers > 1 and len(tasks) > 1:
-        chunksize = max(1, len(tasks) // (workers * 4))
-        with ProcessPoolExecutor(
-            max_workers=workers,
-            initializer=_init_worker,
-            initargs=(bench_map, params, need_rows),
-        ) as ex:
-            for res in ex.map(_screen_symbol_worker, tasks, chunksize=chunksize):
+    if run_mode == "all":
+        if workers > 1 and len(tasks) > 1:
+            chunksize = max(1, len(tasks) // (workers * 4))
+            with ProcessPoolExecutor(
+                max_workers=workers,
+                initializer=_init_worker,
+                initargs=(bench_map, params, need_rows),
+            ) as ex:
+                for res in ex.map(_screen_symbol_worker, tasks, chunksize=chunksize):
+                    if res:
+                        results.append(res)
+        else:
+            for sym, p in tasks:
+                res = screen_symbol(sym, p, params, bench_map, need_rows)
                 if res:
                     results.append(res)
     else:
-        for sym, p in tasks:
-            res = screen_symbol(sym, p, params, bench_map, need_rows)
-            if res:
-                results.append(res)
+        sym, p = tasks[0]
+        res = screen_symbol(sym, p, params, bench_map, need_rows, apply_filters=False)
+        if res:
+            results.append(res)
+        else:
+            raise SystemExit(f"No data available for {display_symbol(sym)}.")
 
     if results:
         symbols = [str(row.get("symbol", "")).strip().upper() for row in results]
@@ -1008,9 +1181,88 @@ def main() -> None:
         earnings_map = fetch_nasdaq_earnings_dates(symbols, session, today=date.today())
         for row in results:
             symbol = str(row.get("symbol", "")).strip().upper()
-            last_date, next_date = earnings_map.get(symbol, ("", ""))
-            row["last_earnings_date"] = last_date
-            row["next_earnings_date"] = next_date
+            info = earnings_map.get(symbol, {})
+            row["last_earnings_date"] = info.get("last", "")
+            row["next_earnings_date"] = info.get("next", "")
+            row["company_name"] = info.get("name", "")
+
+    def parse_earnings_date(value: Any) -> date | None:
+        if not value:
+            return None
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            return datetime.strptime(text, "%m/%d/%Y").date()
+        except Exception:
+            return None
+
+    def to_float(value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            out = float(value)
+        except Exception:
+            return None
+        return out if np.isfinite(out) else None
+
+    def percentile_rank(values: list[float], value: float) -> float:
+        if not values:
+            return 0.0
+        sorted_vals = sorted(values)
+        n = len(sorted_vals)
+        if n == 1:
+            return 1.0
+        left = bisect_left(sorted_vals, value)
+        right = bisect_right(sorted_vals, value)
+        idx = (left + right - 1) / 2.0
+        return idx / (n - 1)
+
+    def score_row(row: dict[str, Any], liquidity_values: list[float]) -> float | None:
+        avg_dollar_volume = to_float(row.get("avg_dollar_volume"))
+        atr_pct = to_float(row.get("atr_pct"))
+        rsi = to_float(row.get("rsi"))
+        if avg_dollar_volume is None or atr_pct is None or rsi is None:
+            return None
+        liquidity_score = percentile_rank(liquidity_values, avg_dollar_volume)
+        if 3.0 <= atr_pct <= 5.5:
+            atr_score = 1.0
+        else:
+            distance = (3.0 - atr_pct) if atr_pct < 3.0 else (atr_pct - 5.5)
+            atr_score = max(0.0, 1.0 - distance / 3.0)
+        rsi_score = max(0.0, min(1.0, 1.0 - abs(rsi - 55.0) / 15.0))
+        macd_ratio_pct = to_float(row.get("macd_signal_ratio_pct_5"))
+        momentum_score = 1.0 if macd_ratio_pct is not None and macd_ratio_pct > 0 else 0.0
+        prev_runs = to_float(row.get("prev_5_runs")) or 0.0
+        consistency_score = min(prev_runs / 5.0, 1.0)
+        return (
+            0.30 * liquidity_score
+            + 0.25 * atr_score
+            + 0.20 * rsi_score
+            + 0.15 * momentum_score
+            + 0.10 * consistency_score
+        )
+
+    def is_score_eligible(row: dict[str, Any], today: date) -> bool:
+        next_earnings = parse_earnings_date(row.get("next_earnings_date"))
+        if next_earnings is not None:
+            days_out = (next_earnings - today).days
+            if 0 <= days_out <= 10:
+                return False
+        atr_pct = to_float(row.get("atr_pct"))
+        if atr_pct is None or atr_pct < 2.5:
+            return False
+        avg_dollar_volume = to_float(row.get("avg_dollar_volume"))
+        if avg_dollar_volume is None or avg_dollar_volume < 10_000_000:
+            return False
+        rsi = to_float(row.get("rsi"))
+        if rsi is None or rsi >= 68:
+            return False
+        return True
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if out_path.suffix.lower() != ".xlsx":
@@ -1018,6 +1270,8 @@ def main() -> None:
 
     header_row = [
         None,
+        "Company",
+        "Prev 5x",
         " Close $",
         None,
         "52W High",
@@ -1044,6 +1298,8 @@ def main() -> None:
     ]
     data_keys = [
         "symbol",
+        "company_name",
+        "prev_5_runs",
         "last_close",
         "last_close_pct_5",
         "high_52w_close",
@@ -1068,22 +1324,61 @@ def main() -> None:
         "last_earnings_date",
         "next_earnings_date",
     ]
+    if args.score_enable:
+        header_row = header_row[:2] + ["Total Score", "Rank"] + header_row[2:]
+        data_keys = data_keys[:2] + ["total_score", "rank"] + data_keys[2:]
     data_date = date_from_int(int(bd[-1])) if len(bd) else date.today()
     headline = data_date.strftime("%d %b %Y").upper()
 
     if out_path.exists():
         wb = load_workbook(out_path)
+        prev_counts = count_recent_symbol_occurrences(wb, max_runs=5) if run_mode == "all" else {}
     else:
         wb = Workbook()
+        prev_counts = {}
 
-    sheet_name = unique_sheet_name(wb, headline)
-    if len(wb.sheetnames) == 1 and is_empty_sheet(wb.active):
-        ws = wb.active
-        ws.title = sheet_name
+    top10: list[dict[str, Any]] = []
+    if results:
+        for row in results:
+            symbol_key = str(row.get("symbol", "")).strip().upper()
+            row["prev_5_runs"] = int(prev_counts.get(symbol_key, 0))
+            if args.score_enable:
+                row["total_score"] = None
+                row["rank"] = None
+    if results and args.score_enable:
+        score_today = date.today()
+        eligible = [row for row in results if is_score_eligible(row, score_today)]
+        liquidity_values = [to_float(row.get("avg_dollar_volume")) for row in eligible]
+        liquidity_values = [val for val in liquidity_values if val is not None]
+        for row in eligible:
+            row["total_score"] = score_row(row, liquidity_values)
+        scored = sorted(
+            [row for row in eligible if row.get("total_score") is not None],
+            key=lambda r: float(r.get("total_score", 0.0)),
+            reverse=True,
+        )
+        top_n = max(args.top_n, 0)
+        top10 = scored[:top_n] if top_n else []
+        for idx, row in enumerate(top10, start=1):
+            row["rank"] = idx
+
+    if run_mode == "single":
+        if "Single Tickers" in wb.sheetnames:
+            ws = wb["Single Tickers"]
+        elif len(wb.sheetnames) == 1 and is_empty_sheet(wb.active):
+            ws = wb.active
+            ws.title = "Single Tickers"
+        else:
+            ws = wb.create_sheet(title="Single Tickers")
     else:
-        ws = wb.create_sheet(title=sheet_name)
+        sheet_name = unique_sheet_name(wb, headline)
+        if len(wb.sheetnames) == 1 and is_empty_sheet(wb.active):
+            ws = wb.active
+            ws.title = sheet_name
+        else:
+            ws = wb.create_sheet(title=sheet_name)
 
-    ws.append(header_row)
+        ws.append(header_row)
 
     if args.beta_freq == "monthly":
         beta_desc = f"{args.beta_months} months\n> {args.beta_min}"
@@ -1103,6 +1398,8 @@ def main() -> None:
     )
     descriptors = [
         None,
+        None,
+        "Last 5 runs",
         None,
         pct_change_desc,
         None,
@@ -1127,7 +1424,10 @@ def main() -> None:
         "Last",
         "Next",
     ]
-    ws.append(descriptors)
+    if args.score_enable:
+        descriptors = descriptors[:2] + [None, None] + descriptors[2:]
+    if run_mode == "all":
+        ws.append(descriptors)
 
     def parse_mmddyyyy(value: Any) -> datetime | None:
         if not value:
@@ -1151,37 +1451,75 @@ def main() -> None:
         except Exception:
             return None
 
-    for row in sorted(results, key=lambda x: str(x["symbol"])):
+    def build_output_row(row: dict[str, Any], prev_count: int | None) -> list[Any]:
         high_52_close = row.get("high_52w_close")
         high_all_close = row.get("high_all_close")
-        ws.append(
+        symbol_display = str(row.get("symbol", "")).strip()
+        company_name = str(row.get("company_name", "")).strip()
+        if company_name:
+            company_name = company_name[:10]
+        last_close_val = row.get("last_close")
+        last_close = float(last_close_val) if last_close_val is not None and np.isfinite(last_close_val) else None
+        avg_dollar_volume = row.get("avg_dollar_volume")
+        avg_dollar_volume_val = (
+            float(avg_dollar_volume) if avg_dollar_volume is not None and np.isfinite(avg_dollar_volume) else None
+        )
+        total_score = row.get("total_score")
+        total_score_val = (
+            float(total_score)
+            if total_score is not None and isinstance(total_score, (float, int, np.floating)) and np.isfinite(total_score)
+            else None
+        )
+        rank_val = row.get("rank") if args.score_enable else None
+        output_row = [
+            symbol_display,
+            company_name,
+        ]
+        if args.score_enable:
+            output_row.extend([total_score_val, rank_val])
+        output_row.extend(
             [
-                str(row["symbol"]),
-                float(row["last_close"]),
-                fmt2(row["last_close_pct_5"]),
+                prev_count,
+                last_close,
+                fmt2(row.get("last_close_pct_5")),
                 float(high_52_close) if high_52_close is not None else None,
                 row.get("high_52w_days_ago"),
                 float(high_all_close) if high_all_close is not None else None,
                 row.get("high_all_days_ago"),
                 parse_mmddyyyy(row.get("last_5pct_higher_date")),
                 row.get("last_5pct_higher_days_ago"),
-                fmt2(row["beta"]),
-                fmt_pct_value(row["beta_pct_5"]),
-                fmt2(row["rsi"]),
-                fmt_pct_value(row["rsi_pct_5"]),
-                fmt_pct_value(row["atr_pct"]),
-                fmt2(row["macd"]),
-                fmt_pct_value(row["macd_pct_5"]),
-                fmt2(row["signal"]),
-                fmt_pct_value(row["signal_pct_5"]),
-                fmt2(row["macd_signal_ratio"]),
-                fmt_pct_value(row["macd_signal_ratio_pct_5"]),
-                float(row["avg_dollar_volume"]),
-                fmt_pct_value(row["avg_dollar_volume_pct_5"]),
+                fmt2(row.get("beta")),
+                fmt_pct_value(row.get("beta_pct_5")),
+                fmt2(row.get("rsi")),
+                fmt_pct_value(row.get("rsi_pct_5")),
+                fmt_pct_value(row.get("atr_pct")),
+                fmt2(row.get("macd")),
+                fmt_pct_value(row.get("macd_pct_5")),
+                fmt2(row.get("signal")),
+                fmt_pct_value(row.get("signal_pct_5")),
+                fmt2(row.get("macd_signal_ratio")),
+                fmt_pct_value(row.get("macd_signal_ratio_pct_5")),
+                avg_dollar_volume_val,
+                fmt_pct_value(row.get("avg_dollar_volume_pct_5")),
                 parse_mmddyyyy(row.get("last_earnings_date")),
                 parse_mmddyyyy(row.get("next_earnings_date")),
             ]
         )
+        return output_row
+
+    if run_mode == "single":
+        data_row = build_output_row(results[0], None)
+        append_single_ticker_section(ws, headline, header_row, descriptors, data_row)
+        auto_size_columns(ws)
+        wb.save(out_path)
+        print(f"Wrote single ticker to {out_path} (Single Tickers)")
+        return
+
+    for row in sorted(results, key=lambda x: str(x["symbol"])):
+        symbol_display = str(row.get("symbol", "")).strip()
+        symbol_key = symbol_display.upper()
+        prev_count = int(prev_counts.get(symbol_key, 0))
+        ws.append(build_output_row(row, prev_count))
 
     black = Color(indexed=8)
     white = Color(indexed=9)
@@ -1209,38 +1547,60 @@ def main() -> None:
     thin_black = Side(style="thin", color=black)
     thick_black = Side(style="thick", color=black)
 
-    header_style_cols = {1, 2, 4, 6, 8, 10, 12, 14, 15, 17, 19, 21, 23}
-    header_value_cols = {2, 4, 6, 8, 10, 12, 14, 15, 17, 19, 21, 23}
-    left_thick_cols = {4, 6, 8, 10, 12, 14, 15, 17, 19, 21, 23}
-    right_thick_cols = {3, 5, 7, 9, 11, 13, 14, 16, 18, 20, 22, 24}
+    score_shift = 2 if args.score_enable else 0
+
+    def shift_col_idx(idx: int) -> int:
+        if score_shift == 0 or idx <= 2:
+            return idx
+        return idx + score_shift
+
+    def shift_cols(cols: set[int]) -> set[int]:
+        return {shift_col_idx(col) for col in cols}
+
+    header_style_cols = shift_cols({1, 2, 3, 4, 6, 8, 10, 12, 14, 16, 17, 19, 21, 23, 25})
+    header_value_cols = shift_cols({2, 3, 4, 6, 8, 10, 12, 14, 16, 17, 19, 21, 23, 25})
+    if args.score_enable:
+        header_style_cols.update({3, 4})
+        header_value_cols.update({3, 4})
+    left_thick_cols = shift_cols({4, 6, 8, 10, 12, 14, 16, 17, 19, 21, 23, 25})
+    right_thick_cols = shift_cols({5, 7, 9, 11, 13, 15, 16, 18, 20, 22, 24, 26})
+    header_right_cols = {shift_col_idx(25), shift_col_idx(26)} if args.score_enable else {25, 26}
 
     # Column widths from the sample spreadsheet
-    column_widths = {
+    base_column_widths = {
         1: 8.0,
-        2: 9.0,
-        3: 12.0,
-        4: 13.5,
-        5: 8.44531,
-        6: 13.1562,
-        7: 9.39844,
-        8: 10.6641,
-        9: 13.0,
-        10: 10.0,
-        11: 11.0,
-        12: 14.0,
-        13: 10.0,
-        14: 17.0,
-        15: 15.0,
-        16: 11.0,
-        17: 9.0,
-        18: 13.0,
-        19: 12.2812,
-        20: 14.7578,
-        21: 15.6797,
-        22: 12.5312,
-        23: 14.2734,
-        24: 13.0,
+        2: 12.0,
+        3: 8.0,
+        4: 9.0,
+        5: 12.0,
+        6: 13.5,
+        7: 8.44531,
+        8: 13.1562,
+        9: 9.39844,
+        10: 10.6641,
+        11: 13.0,
+        12: 10.0,
+        13: 11.0,
+        14: 14.0,
+        15: 10.0,
+        16: 17.0,
+        17: 15.0,
+        18: 11.0,
+        19: 9.0,
+        20: 13.0,
+        21: 12.2812,
+        22: 14.7578,
+        23: 15.6797,
+        24: 12.5312,
+        25: 14.2734,
+        26: 13.0,
     }
+    column_widths = (
+        {shift_col_idx(k): v for k, v in base_column_widths.items()} if args.score_enable else base_column_widths
+    )
+    if args.score_enable:
+        column_widths[3] = 10.0
+        column_widths[4] = 6.0
     for col_idx, width in column_widths.items():
         ws.column_dimensions[get_column_letter(col_idx)].width = width
 
@@ -1259,7 +1619,7 @@ def main() -> None:
             cell.number_format = "@"
         cell.border = Border(
             left=thin_red if col_idx == 1 else None,
-            right=thin_red if col_idx in (23, 24) else None,
+            right=thin_red if col_idx in header_right_cols else None,
             top=thin_red,
         )
 
@@ -1275,35 +1635,45 @@ def main() -> None:
             right=thick_black if col_idx in right_thick_cols else None,
         )
 
-    bold_cols = {2, 4, 6}
-    left_center_cols = {5, 7, 9}
-    center_bottom_cols = {15, 17, 19}
-    number_formats = {
+    bold_cols = shift_cols({4, 6, 8})
+    left_center_cols = shift_cols({7, 9, 11})
+    center_bottom_cols = shift_cols({17, 19, 21})
+    base_number_formats = {
         1: "@",
-        2: '"$"#,##0.00',
-        3: "@",
+        2: "@",
+        3: "0",
         4: '"$"#,##0.00',
-        5: "General",
+        5: "@",
         6: '"$"#,##0.00',
         7: "General",
-        8: "mmm d, yyyy",
+        8: '"$"#,##0.00',
         9: "General",
-        10: "@",
-        11: "0%",
+        10: "mmm d, yyyy",
+        11: "General",
         12: "@",
         13: "0%",
-        14: "0%",
-        15: "@",
+        14: "@",
+        15: "0%",
         16: "0%",
         17: "@",
         18: "0%",
         19: "@",
         20: "0%",
-        21: '"$"#,##0.00',
+        21: "@",
         22: "0%",
-        23: "mmm d, yyyy",
-        24: "mmm d, yyyy",
+        23: '"$"#,##0.00',
+        24: "0%",
+        25: "mmm d, yyyy",
+        26: "mmm d, yyyy",
     }
+    number_formats = (
+        {shift_col_idx(k): v for k, v in base_number_formats.items()}
+        if args.score_enable
+        else base_number_formats
+    )
+    if args.score_enable:
+        number_formats[3] = "0.000"
+        number_formats[4] = "0"
 
     for row_idx in range(3, ws.max_row + 1):
         for col_idx in range(1, ws.max_column + 1):
@@ -1326,19 +1696,22 @@ def main() -> None:
                 right=thick_black if col_idx in right_thick_cols else thin_black,
             )
 
-    for start_col, end_col in [
-        (2, 3),
+    merge_pairs = [
         (4, 5),
         (6, 7),
         (8, 9),
         (10, 11),
         (12, 13),
-        (15, 16),
+        (14, 15),
         (17, 18),
         (19, 20),
         (21, 22),
         (23, 24),
-    ]:
+        (25, 26),
+    ]
+    if args.score_enable:
+        merge_pairs = [(shift_col_idx(start), shift_col_idx(end)) for start, end in merge_pairs]
+    for start_col, end_col in merge_pairs:
         ws.merge_cells(start_row=1, start_column=start_col, end_row=1, end_column=end_col)
 
     ws.freeze_panes = None
