@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import calendar
 import csv
+import io
 import os
 from bisect import bisect_left, bisect_right
 from datetime import date, datetime, timedelta
@@ -398,6 +399,8 @@ NASDAQ_HEADERS = {
     "Accept": "application/json, text/plain, */*",
     "Referer": "https://www.nasdaq.com/",
 }
+ALPHAVANTAGE_IPO_URL = "https://www.alphavantage.co/query"
+ALPHAVANTAGE_API_KEY = "F7HUZ9ETATI052FB"
 
 
 def _format_mmddyyyy(d: date | None) -> str:
@@ -508,6 +511,131 @@ def fetch_nasdaq_earnings_dates(
             "name": company_names.get(sym, ""),
         }
     return out
+
+
+def fetch_alphavantage_upcoming_ipos(
+    api_key: str,
+    session: requests.Session,
+    start_date: date,
+    end_date: date,
+) -> list[dict[str, Any]]:
+    """
+    Fetch upcoming IPOs from Alpha Vantage IPO calendar and keep only entries
+    scheduled from start_date through end_date (inclusive).
+    """
+    if not api_key.strip():
+        return []
+
+    try:
+        resp = session.get(
+            ALPHAVANTAGE_IPO_URL,
+            params={"function": "IPO_CALENDAR", "apikey": api_key.strip()},
+            timeout=20,
+        )
+        if resp.status_code != 200:
+            return []
+        body = resp.text or ""
+    except Exception:
+        return []
+
+    if not body.strip():
+        return []
+
+    rows: list[dict[str, Any]] = []
+    try:
+        reader = csv.DictReader(io.StringIO(body))
+        for row in reader:
+            ipo_text = str(row.get("ipoDate", "")).strip()
+            if not ipo_text:
+                continue
+            try:
+                ipo_dt = datetime.strptime(ipo_text, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            if not (start_date <= ipo_dt <= end_date):
+                continue
+
+            rows.append(
+                {
+                    "symbol": str(row.get("symbol", "")).strip(),
+                    "name": str(row.get("name", "")).strip(),
+                    "ipo_date": ipo_dt,
+                    "price_range": str(row.get("priceRange", "")).strip(),
+                    "exchange": str(row.get("exchange", "")).strip(),
+                    "currency": str(row.get("currency", "")).strip(),
+                    "shares_offered": str(row.get("sharesOffered", "")).strip(),
+                    "estimated_volume": str(row.get("estimatedVolume", "")).strip(),
+                }
+            )
+    except Exception:
+        return []
+
+    rows.sort(key=lambda x: (x["ipo_date"], x["symbol"]))
+    return rows
+
+
+def write_upcoming_ipos_sheet(
+    wb: Workbook,
+    ipo_rows: list[dict[str, Any]],
+    start_date: date,
+    end_date: date,
+) -> None:
+    """
+    Create or replace a workbook tab with upcoming IPOs for the selected window.
+    """
+    sheet_name = "Upcoming IPOs (60D)"
+    if sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        merged_ranges = list(ws.merged_cells.ranges)
+        for rng in merged_ranges:
+            ws.unmerge_cells(str(rng))
+        if ws.max_row > 0:
+            ws.delete_rows(1, ws.max_row)
+    else:
+        ws = wb.create_sheet(title=sheet_name)
+
+    ws.append([f"Upcoming IPOs from {start_date.isoformat()} to {end_date.isoformat()}"])
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=8)
+    ws["A1"].font = Font(name="Calibri", size=12, bold=True)
+    ws["A1"].alignment = Alignment(horizontal="left", vertical="center")
+
+    headers = [
+        "Symbol",
+        "Company",
+        "IPO Date",
+        "Price Range",
+        "Exchange",
+        "Currency",
+        "Shares Offered",
+        "Estimated Volume",
+    ]
+    ws.append(headers)
+    for col_idx in range(1, len(headers) + 1):
+        cell = ws.cell(row=2, column=col_idx)
+        cell.font = Font(name="Calibri", size=11, bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    if ipo_rows:
+        for row in ipo_rows:
+            ws.append(
+                [
+                    row.get("symbol", ""),
+                    row.get("name", ""),
+                    row.get("ipo_date"),
+                    row.get("price_range", ""),
+                    row.get("exchange", ""),
+                    row.get("currency", ""),
+                    row.get("shares_offered", ""),
+                    row.get("estimated_volume", ""),
+                ]
+            )
+    else:
+        ws.append(["No upcoming IPOs found in this date range.", "", "", "", "", "", "", ""])
+
+    for row_idx in range(3, ws.max_row + 1):
+        ws.cell(row=row_idx, column=3).number_format = "mmm d, yyyy"
+
+    auto_size_columns(ws, min_width=10, max_width=45)
 
 
 def fmt2(x: Any) -> str:
@@ -935,6 +1063,11 @@ def main() -> None:
         "--out",
         default="results.xlsx",
         help='Output Excel (.xlsx) path (supports ${workspaceFolder}, ~, env vars)',
+    )
+    ap.add_argument(
+        "--alphavantage_api_key",
+        default=ALPHAVANTAGE_API_KEY,
+        help="Alpha Vantage API key (defaults to hardcoded project key).",
     )
 
     ap.add_argument("--benchmark", default="SPY.US")
@@ -1510,6 +1643,10 @@ def main() -> None:
     if run_mode == "single":
         data_row = build_output_row(results[0], None)
         append_single_ticker_section(ws, headline, header_row, descriptors, data_row)
+        ipo_start = date.today()
+        ipo_end = ipo_start + timedelta(days=60)
+        ipo_rows = fetch_alphavantage_upcoming_ipos(args.alphavantage_api_key, requests.Session(), ipo_start, ipo_end)
+        write_upcoming_ipos_sheet(wb, ipo_rows, ipo_start, ipo_end)
         auto_size_columns(ws)
         wb.save(out_path)
         print(f"Wrote single ticker to {out_path} (Single Tickers)")
@@ -1718,6 +1855,11 @@ def main() -> None:
         ws.merge_cells(start_row=1, start_column=start_col, end_row=1, end_column=end_col)
 
     ws.freeze_panes = None
+
+    ipo_start = date.today()
+    ipo_end = ipo_start + timedelta(days=60)
+    ipo_rows = fetch_alphavantage_upcoming_ipos(args.alphavantage_api_key, requests.Session(), ipo_start, ipo_end)
+    write_upcoming_ipos_sheet(wb, ipo_rows, ipo_start, ipo_end)
 
     wb.save(out_path)
 
