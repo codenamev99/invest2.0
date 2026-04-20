@@ -1638,6 +1638,9 @@ def main() -> None:
     bold_cols = shift_cols({4, 6, 8})
     left_center_cols = shift_cols({7, 9, 11})
     center_bottom_cols = shift_cols({17, 19, 21})
+    # Percentage-like values are already computed as percent points (e.g. 21.59),
+    # so use a literal % format to avoid Excel multiplying by 100.
+    pct_literal_format = "0.00\\%"
     base_number_formats = {
         1: "@",
         2: "@",
@@ -1651,18 +1654,18 @@ def main() -> None:
         10: "mmm d, yyyy",
         11: "General",
         12: "@",
-        13: "0%",
+        13: pct_literal_format,
         14: "@",
-        15: "0%",
-        16: "0%",
+        15: pct_literal_format,
+        16: pct_literal_format,
         17: "@",
-        18: "0%",
+        18: pct_literal_format,
         19: "@",
-        20: "0%",
+        20: pct_literal_format,
         21: "@",
-        22: "0%",
+        22: pct_literal_format,
         23: '"$"#,##0.00',
-        24: "0%",
+        24: pct_literal_format,
         25: "mmm d, yyyy",
         26: "mmm d, yyyy",
     }
