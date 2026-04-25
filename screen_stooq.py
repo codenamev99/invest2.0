@@ -596,8 +596,9 @@ def write_upcoming_ipos_sheet(
 
     ws.append([f"Upcoming IPOs from {start_date.isoformat()} to {end_date.isoformat()}"])
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=8)
-    ws["A1"].font = Font(name="Calibri", size=12, bold=True)
+    ws["A1"].font = Font(name="Calibri", size=13, bold=True, color=Color(indexed=9))
     ws["A1"].alignment = Alignment(horizontal="left", vertical="center")
+    ws["A1"].fill = PatternFill(fill_type="solid", fgColor=Color(indexed=8))
 
     headers = [
         "Symbol",
@@ -610,10 +611,23 @@ def write_upcoming_ipos_sheet(
         "Estimated Volume",
     ]
     ws.append(headers)
+    ws.row_dimensions[1].height = 50.85
+    ws.row_dimensions[2].height = 34.85
+    descriptor_fill = PatternFill(fill_type="solid", fgColor=Color(indexed=9))
+    descriptor_font = Font(name="Calibri", size=11, bold=True, italic=True, color=Color(indexed=8))
+    descriptor_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    thin_red = Side(style="thin", color=Color(indexed=10))
+    thick_black = Side(style="thick", color=Color(indexed=8))
+
     for col_idx in range(1, len(headers) + 1):
         cell = ws.cell(row=2, column=col_idx)
-        cell.font = Font(name="Calibri", size=11, bold=True)
-        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.fill = descriptor_fill
+        cell.font = descriptor_font
+        cell.alignment = descriptor_align
+        cell.border = Border(
+            left=thin_red if col_idx == 1 else thick_black,
+            right=thick_black,
+        )
 
     if ipo_rows:
         for row in ipo_rows:
@@ -799,6 +813,25 @@ def count_recent_symbol_occurrences(wb: Workbook, max_runs: int = 5) -> dict[str
             counts[sym] = counts.get(sym, 0) + 1
 
     return counts
+
+
+def prune_old_run_sheets(
+    wb: Workbook,
+    keep_runs: int = 7,
+    protected_names: set[str] | None = None,
+) -> None:
+    """
+    Keep only the most recent run-result sheets in workbook order.
+    """
+    if keep_runs < 0:
+        keep_runs = 0
+    keep_protected = protected_names or {"Single Tickers", "Upcoming IPOs (60D)"}
+    run_sheet_names = [name for name in wb.sheetnames if name not in keep_protected]
+    remove_count = len(run_sheet_names) - keep_runs
+    if remove_count <= 0:
+        return
+    for name in run_sheet_names[:remove_count]:
+        del wb[name]
 
 
 def auto_size_columns(ws, min_width: int = 8, max_width: int = 40) -> None:
@@ -1458,8 +1491,8 @@ def main() -> None:
         "next_earnings_date",
     ]
     if args.score_enable:
-        header_row = header_row[:2] + ["Total Score", "Rank"] + header_row[2:]
-        data_keys = data_keys[:2] + ["total_score", "rank"] + data_keys[2:]
+        header_row = header_row[:2] + ["Rank"] + header_row[2:]
+        data_keys = data_keys[:2] + ["rank"] + data_keys[2:]
     data_date = date_from_int(int(bd[-1])) if len(bd) else date.today()
     headline = data_date.strftime("%d %b %Y").upper()
 
@@ -1558,7 +1591,7 @@ def main() -> None:
         "Next",
     ]
     if args.score_enable:
-        descriptors = descriptors[:2] + [None, None] + descriptors[2:]
+        descriptors = descriptors[:2] + [None] + descriptors[2:]
     if run_mode == "all":
         ws.append(descriptors)
 
@@ -1597,41 +1630,35 @@ def main() -> None:
         avg_dollar_volume_val = (
             float(avg_dollar_volume) if avg_dollar_volume is not None and np.isfinite(avg_dollar_volume) else None
         )
-        total_score = row.get("total_score")
-        total_score_val = (
-            float(total_score)
-            if total_score is not None and isinstance(total_score, (float, int, np.floating)) and np.isfinite(total_score)
-            else None
-        )
         rank_val = row.get("rank") if args.score_enable else None
         output_row = [
             symbol_display,
             company_name,
         ]
         if args.score_enable:
-            output_row.extend([total_score_val, rank_val])
+            output_row.append(rank_val)
         output_row.extend(
             [
                 prev_count,
                 last_close,
-                fmt2(row.get("last_close_pct_5")),
+                fmt_pct_value(row.get("last_close_pct_5")),
                 float(high_52_close) if high_52_close is not None else None,
                 row.get("high_52w_days_ago"),
                 float(high_all_close) if high_all_close is not None else None,
                 row.get("high_all_days_ago"),
                 parse_mmddyyyy(row.get("last_5pct_higher_date")),
                 row.get("last_5pct_higher_days_ago"),
-                fmt2(row.get("beta")),
+                to_float(row.get("beta")),
                 fmt_pct_value(row.get("beta_pct_5")),
-                fmt2(row.get("rsi")),
+                to_float(row.get("rsi")),
                 fmt_pct_value(row.get("rsi_pct_5")),
                 fmt_pct_value(row.get("atr_pct")),
-                fmt2(row.get("macd")),
+                to_float(row.get("macd")),
                 fmt_pct_value(row.get("macd_pct_5")),
-                fmt2(row.get("signal")),
+                to_float(row.get("signal")),
                 fmt_pct_value(row.get("signal_pct_5")),
                 fmt2(row.get("macd_signal_ratio")),
-                fmt_pct_value(row.get("macd_signal_ratio_pct_5")),
+                to_float(row.get("macd_signal_ratio")),
                 avg_dollar_volume_val,
                 fmt_pct_value(row.get("avg_dollar_volume_pct_5")),
                 parse_mmddyyyy(row.get("last_earnings_date")),
@@ -1684,7 +1711,7 @@ def main() -> None:
     thin_black = Side(style="thin", color=black)
     thick_black = Side(style="thick", color=black)
 
-    score_shift = 2 if args.score_enable else 0
+    score_shift = 1 if args.score_enable else 0
 
     def shift_col_idx(idx: int) -> int:
         if score_shift == 0 or idx <= 2:
@@ -1697,8 +1724,8 @@ def main() -> None:
     header_style_cols = shift_cols({1, 2, 3, 4, 6, 8, 10, 12, 14, 16, 17, 19, 21, 23, 25})
     header_value_cols = shift_cols({2, 3, 4, 6, 8, 10, 12, 14, 16, 17, 19, 21, 23, 25})
     if args.score_enable:
-        header_style_cols.update({3, 4})
-        header_value_cols.update({3, 4})
+        header_style_cols.update({3})
+        header_value_cols.update({3})
     left_thick_cols = shift_cols({4, 6, 8, 10, 12, 14, 16, 17, 19, 21, 23, 25})
     right_thick_cols = shift_cols({5, 7, 9, 11, 13, 15, 16, 18, 20, 22, 24, 26})
     header_right_cols = {shift_col_idx(25), shift_col_idx(26)} if args.score_enable else {25, 26}
@@ -1736,8 +1763,7 @@ def main() -> None:
         {shift_col_idx(k): v for k, v in base_column_widths.items()} if args.score_enable else base_column_widths
     )
     if args.score_enable:
-        column_widths[3] = 10.0
-        column_widths[4] = 6.0
+        column_widths[3] = 6.0
     for col_idx, width in column_widths.items():
         ws.column_dimensions[get_column_letter(col_idx)].width = width
 
@@ -1776,30 +1802,30 @@ def main() -> None:
     left_center_cols = shift_cols({7, 9, 11})
     center_bottom_cols = shift_cols({17, 19, 21})
     # Percentage-like values are already computed as percent points (e.g. 21.59),
-    # so use a literal % format to avoid Excel multiplying by 100.
-    pct_literal_format = "0.00\\%"
+    # so use a literal percent-sign format to avoid Excel multiplying by 100.
+    pct_literal_format = '0.00"%"'
     base_number_formats = {
         1: "@",
         2: "@",
         3: "0",
         4: '"$"#,##0.00',
-        5: "@",
+        5: pct_literal_format,
         6: '"$"#,##0.00',
         7: "General",
         8: '"$"#,##0.00',
         9: "General",
         10: "mmm d, yyyy",
         11: "General",
-        12: "@",
+        12: "0.00",
         13: pct_literal_format,
-        14: "@",
+        14: "0.00",
         15: pct_literal_format,
         16: pct_literal_format,
-        17: "@",
+        17: "0.00",
         18: pct_literal_format,
-        19: "@",
+        19: "0.00",
         20: pct_literal_format,
-        21: "@",
+        21: "0.00",
         22: pct_literal_format,
         23: '"$"#,##0.00',
         24: pct_literal_format,
@@ -1812,8 +1838,7 @@ def main() -> None:
         else base_number_formats
     )
     if args.score_enable:
-        number_formats[3] = "0.000"
-        number_formats[4] = "0"
+        number_formats[3] = "0"
 
     for row_idx in range(3, ws.max_row + 1):
         for col_idx in range(1, ws.max_column + 1):
@@ -1860,6 +1885,7 @@ def main() -> None:
     ipo_end = ipo_start + timedelta(days=60)
     ipo_rows = fetch_alphavantage_upcoming_ipos(args.alphavantage_api_key, requests.Session(), ipo_start, ipo_end)
     write_upcoming_ipos_sheet(wb, ipo_rows, ipo_start, ipo_end)
+    prune_old_run_sheets(wb, keep_runs=7)
 
     wb.save(out_path)
 
