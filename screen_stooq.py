@@ -401,6 +401,9 @@ NASDAQ_HEADERS = {
 }
 ALPHAVANTAGE_IPO_URL = "https://www.alphavantage.co/query"
 ALPHAVANTAGE_API_KEY = "F7HUZ9ETATI052FB"
+UPCOMING_IPOS_SHEET_NAME = "Upcoming IPOs (60D)"
+UPCOMING_EARNINGS_SHEET_NAME = "Upcoming Earnings (14D)"
+PROTECTED_SHEET_NAMES = {"Single Tickers", UPCOMING_IPOS_SHEET_NAME, UPCOMING_EARNINGS_SHEET_NAME}
 
 
 def _format_mmddyyyy(d: date | None) -> str:
@@ -513,6 +516,47 @@ def fetch_nasdaq_earnings_dates(
     return out
 
 
+def fetch_nasdaq_upcoming_earnings(
+    session: requests.Session,
+    start_date: date,
+    end_date: date,
+) -> list[dict[str, Any]]:
+    """
+    Fetch all Nasdaq earnings calendar rows scheduled from start_date through end_date.
+    """
+    if end_date < start_date:
+        return []
+
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, date]] = set()
+    cache: dict[date, list[dict[str, Any]]] = {}
+    days = (end_date - start_date).days
+    for offset in range(days + 1):
+        earnings_date = start_date + timedelta(days=offset)
+        for row in _nasdaq_calendar_rows(earnings_date, session, cache):
+            symbol = str(row.get("symbol", "")).strip().upper()
+            if not symbol:
+                continue
+            key = (symbol, earnings_date)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "name": _extract_company_name(row),
+                    "earnings_date": earnings_date,
+                    "time": str(row.get("time") or row.get("timeOfDay") or "").strip(),
+                    "eps_forecast": str(row.get("epsForecast") or row.get("eps_forecast") or "").strip(),
+                    "no_of_estimates": str(row.get("noOfEsts") or row.get("no_of_estimates") or "").strip(),
+                    "last_year_eps": str(row.get("lastYearEPS") or row.get("last_year_eps") or "").strip(),
+                }
+            )
+
+    rows.sort(key=lambda x: (x["earnings_date"], x["symbol"]))
+    return rows
+
+
 def fetch_alphavantage_upcoming_ipos(
     api_key: str,
     session: requests.Session,
@@ -583,7 +627,7 @@ def write_upcoming_ipos_sheet(
     """
     Create or replace a workbook tab with upcoming IPOs for the selected window.
     """
-    sheet_name = "Upcoming IPOs (60D)"
+    sheet_name = UPCOMING_IPOS_SHEET_NAME
     if sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
         merged_ranges = list(ws.merged_cells.ranges)
@@ -648,6 +692,90 @@ def write_upcoming_ipos_sheet(
 
     for row_idx in range(3, ws.max_row + 1):
         ws.cell(row=row_idx, column=3).number_format = "mmm d, yyyy"
+
+    auto_size_columns(ws, min_width=10, max_width=45)
+
+
+def write_upcoming_earnings_sheet(
+    wb: Workbook,
+    earnings_rows: list[dict[str, Any]],
+    start_date: date,
+    end_date: date,
+    qualified_dates: dict[str, date],
+) -> None:
+    """
+    Create or replace a workbook tab with upcoming earnings and current-run qualification.
+    """
+    sheet_name = UPCOMING_EARNINGS_SHEET_NAME
+    if sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        merged_ranges = list(ws.merged_cells.ranges)
+        for rng in merged_ranges:
+            ws.unmerge_cells(str(rng))
+        if ws.max_row > 0:
+            ws.delete_rows(1, ws.max_row)
+    else:
+        ws = wb.create_sheet(title=sheet_name)
+
+    ws.append([f"Upcoming earnings from {start_date.isoformat()} to {end_date.isoformat()}"])
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=9)
+    ws["A1"].font = Font(name="Calibri", size=13, bold=True, color=Color(indexed=9))
+    ws["A1"].alignment = Alignment(horizontal="left", vertical="center")
+    ws["A1"].fill = PatternFill(fill_type="solid", fgColor=Color(indexed=8))
+
+    headers = [
+        "Symbol",
+        "Company",
+        "Earnings Date",
+        "Time",
+        "EPS Forecast",
+        "No. of Estimates",
+        "Last Year EPS",
+        "Qualified Results?",
+        "Qualified Date",
+    ]
+    ws.append(headers)
+    ws.row_dimensions[1].height = 50.85
+    ws.row_dimensions[2].height = 34.85
+    descriptor_fill = PatternFill(fill_type="solid", fgColor=Color(indexed=9))
+    descriptor_font = Font(name="Calibri", size=11, bold=True, italic=True, color=Color(indexed=8))
+    descriptor_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    thin_red = Side(style="thin", color=Color(indexed=10))
+    thick_black = Side(style="thick", color=Color(indexed=8))
+
+    for col_idx in range(1, len(headers) + 1):
+        cell = ws.cell(row=2, column=col_idx)
+        cell.fill = descriptor_fill
+        cell.font = descriptor_font
+        cell.alignment = descriptor_align
+        cell.border = Border(
+            left=thin_red if col_idx == 1 else thick_black,
+            right=thick_black,
+        )
+
+    if earnings_rows:
+        for row in earnings_rows:
+            symbol = str(row.get("symbol", "")).strip().upper()
+            qualified_date = qualified_dates.get(symbol)
+            ws.append(
+                [
+                    symbol,
+                    row.get("name", ""),
+                    row.get("earnings_date"),
+                    row.get("time", ""),
+                    row.get("eps_forecast", ""),
+                    row.get("no_of_estimates", ""),
+                    row.get("last_year_eps", ""),
+                    "Yes" if qualified_date else "No",
+                    qualified_date,
+                ]
+            )
+    else:
+        ws.append(["No upcoming earnings found in this date range.", "", "", "", "", "", "", "", ""])
+
+    for row_idx in range(3, ws.max_row + 1):
+        ws.cell(row=row_idx, column=3).number_format = "mmm d, yyyy"
+        ws.cell(row=row_idx, column=9).number_format = "mmm d, yyyy"
 
     auto_size_columns(ws, min_width=10, max_width=45)
 
@@ -794,11 +922,10 @@ def count_recent_symbol_occurrences(wb: Workbook, max_runs: int = 5) -> dict[str
     if max_runs <= 0 or not wb.sheetnames:
         return {}
 
-    recent_names = wb.sheetnames[-max_runs:]
+    run_sheet_names = [name for name in wb.sheetnames if name not in PROTECTED_SHEET_NAMES]
+    recent_names = run_sheet_names[-max_runs:]
     counts: dict[str, int] = {}
     for name in recent_names:
-        if name == "Single Tickers":
-            continue
         ws = wb[name]
         if is_empty_sheet(ws):
             continue
@@ -815,6 +942,55 @@ def count_recent_symbol_occurrences(wb: Workbook, max_runs: int = 5) -> dict[str
     return counts
 
 
+def _parse_run_sheet_date(sheet_name: str) -> date | None:
+    base_name = sheet_name.split(" (", 1)[0].strip()
+    try:
+        return datetime.strptime(base_name, "%d %b %Y").date()
+    except Exception:
+        return None
+
+
+def collect_qualified_result_dates(
+    wb: Workbook,
+    current_results: list[dict[str, Any]] | None = None,
+    current_date: date | None = None,
+) -> dict[str, date]:
+    """
+    Map each symbol that appeared in a regular results sheet to its latest qualifying date.
+    """
+    qualified_dates: dict[str, date] = {}
+
+    for name in wb.sheetnames:
+        if name in PROTECTED_SHEET_NAMES:
+            continue
+        sheet_date = _parse_run_sheet_date(name)
+        if sheet_date is None:
+            continue
+        ws = wb[name]
+        if is_empty_sheet(ws):
+            continue
+        for (val,) in ws.iter_rows(min_row=3, max_row=ws.max_row, min_col=1, max_col=1, values_only=True):
+            if val is None:
+                continue
+            sym = str(val).strip().upper()
+            if not sym:
+                continue
+            existing = qualified_dates.get(sym)
+            if existing is None or sheet_date > existing:
+                qualified_dates[sym] = sheet_date
+
+    if current_results and current_date is not None:
+        for row in current_results:
+            sym = str(row.get("symbol", "")).strip().upper()
+            if not sym:
+                continue
+            existing = qualified_dates.get(sym)
+            if existing is None or current_date > existing:
+                qualified_dates[sym] = current_date
+
+    return qualified_dates
+
+
 def prune_old_run_sheets(
     wb: Workbook,
     keep_runs: int = 7,
@@ -825,7 +1001,7 @@ def prune_old_run_sheets(
     """
     if keep_runs < 0:
         keep_runs = 0
-    keep_protected = protected_names or {"Single Tickers", "Upcoming IPOs (60D)"}
+    keep_protected = protected_names or PROTECTED_SHEET_NAMES
     run_sheet_names = [name for name in wb.sheetnames if name not in keep_protected]
     remove_count = len(run_sheet_names) - keep_runs
     if remove_count <= 0:
@@ -1528,6 +1704,12 @@ def main() -> None:
         for idx, row in enumerate(top10, start=1):
             row["rank"] = idx
 
+    qualified_dates = collect_qualified_result_dates(
+        wb,
+        current_results=results if run_mode == "all" else None,
+        current_date=data_date if run_mode == "all" else None,
+    )
+
     if run_mode == "single":
         if "Single Tickers" in wb.sheetnames:
             ws = wb["Single Tickers"]
@@ -1672,8 +1854,13 @@ def main() -> None:
         append_single_ticker_section(ws, headline, header_row, descriptors, data_row)
         ipo_start = date.today()
         ipo_end = ipo_start + timedelta(days=60)
-        ipo_rows = fetch_alphavantage_upcoming_ipos(args.alphavantage_api_key, requests.Session(), ipo_start, ipo_end)
+        session = requests.Session()
+        ipo_rows = fetch_alphavantage_upcoming_ipos(args.alphavantage_api_key, session, ipo_start, ipo_end)
         write_upcoming_ipos_sheet(wb, ipo_rows, ipo_start, ipo_end)
+        earnings_start = date.today()
+        earnings_end = earnings_start + timedelta(days=14)
+        earnings_rows = fetch_nasdaq_upcoming_earnings(session, earnings_start, earnings_end)
+        write_upcoming_earnings_sheet(wb, earnings_rows, earnings_start, earnings_end, qualified_dates)
         auto_size_columns(ws)
         wb.save(out_path)
         print(f"Wrote single ticker to {out_path} (Single Tickers)")
@@ -1883,8 +2070,13 @@ def main() -> None:
 
     ipo_start = date.today()
     ipo_end = ipo_start + timedelta(days=60)
-    ipo_rows = fetch_alphavantage_upcoming_ipos(args.alphavantage_api_key, requests.Session(), ipo_start, ipo_end)
+    session = requests.Session()
+    ipo_rows = fetch_alphavantage_upcoming_ipos(args.alphavantage_api_key, session, ipo_start, ipo_end)
     write_upcoming_ipos_sheet(wb, ipo_rows, ipo_start, ipo_end)
+    earnings_start = date.today()
+    earnings_end = earnings_start + timedelta(days=14)
+    earnings_rows = fetch_nasdaq_upcoming_earnings(session, earnings_start, earnings_end)
+    write_upcoming_earnings_sheet(wb, earnings_rows, earnings_start, earnings_end, qualified_dates)
     prune_old_run_sheets(wb, keep_runs=7)
 
     wb.save(out_path)
