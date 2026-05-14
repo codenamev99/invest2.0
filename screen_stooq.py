@@ -7,12 +7,13 @@ import io
 import os
 from bisect import bisect_left, bisect_right
 from datetime import date, datetime, timedelta
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import requests
+from scipy.signal import lfilter
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Color, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
@@ -45,21 +46,24 @@ def read_last_lines(path: Path, n: int = 600) -> list[str]:
     """
     block = 64 * 1024  # 64KB
     chunks: list[bytes] = []
+    target = n + 20
+    newline_count = 0
 
     with path.open("rb") as f:
         f.seek(0, 2)  # end
         pos = f.tell()
-
-        lines: list[bytes] = []
-        while pos > 0 and len(lines) < n + 20:
+        while pos > 0 and newline_count < target:
             read_size = min(block, pos)
             pos -= read_size
             f.seek(pos)
-            chunks.append(f.read(read_size))
-            data = b"".join(reversed(chunks))
-            lines = data.splitlines()
+            chunk = f.read(read_size)
+            chunks.append(chunk)
+            newline_count += chunk.count(b"\n")
 
-    tail = lines[-(n + 20):]
+    # Join once at the end instead of on every loop iteration
+    data = b"".join(reversed(chunks))
+    lines = data.splitlines()
+    tail = lines[-target:]
     return [ln.decode("utf-8", errors="ignore") for ln in tail]
 
 
@@ -111,18 +115,59 @@ def load_series_from_file(
     return d, c, v, h, l
 
 
+def load_ohlc_from_file(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Returns (dates_int, open, high, low, close) sorted by date.
+    Reads the full file so validation can look forward from older ranking dates.
+    """
+    rows: list[tuple[int, float, float, float, float]] = []
+    with path.open("r", encoding="utf-8", errors="ignore") as f:
+        for ln in f:
+            ln = ln.strip()
+            if not ln or ln.startswith("<TICKER>"):
+                continue
+
+            parts = ln.split(",")
+            if len(parts) < 9 or parts[1] != "D":
+                continue
+
+            try:
+                date_i = int(parts[2])
+                open_ = float(parts[4])
+                high = float(parts[5])
+                low = float(parts[6])
+                close = float(parts[7])
+            except ValueError:
+                continue
+
+            rows.append((date_i, open_, high, low, close))
+
+    if not rows:
+        empty = np.array([], dtype=float)
+        return np.array([], dtype=np.int32), empty, empty, empty, empty
+
+    rows.sort(key=lambda x: x[0])
+    d = np.array([r[0] for r in rows], dtype=np.int32)
+    o = np.array([r[1] for r in rows], dtype=float)
+    h = np.array([r[2] for r in rows], dtype=float)
+    l = np.array([r[3] for r in rows], dtype=float)
+    c = np.array([r[4] for r in rows], dtype=float)
+    return d, o, h, l, c
+
+
 # -----------------------------
 # Indicators
 # -----------------------------
 def ema(x: np.ndarray, span: int) -> np.ndarray:
-    alpha = 2.0 / (span + 1.0)
-    out = np.empty_like(x, dtype=float)
-    out[:] = np.nan
     if len(x) == 0:
-        return out
-    out[0] = x[0]
-    for i in range(1, len(x)):
-        out[i] = alpha * x[i] + (1.0 - alpha) * out[i - 1]
+        return np.empty(0, dtype=float)
+    x = x.astype(float)
+    alpha = 2.0 / (span + 1.0)
+    # IIR filter: y[n] = alpha*x[n] + (1-alpha)*y[n-1], seeded at x[0].
+    # Direct Form II transposed initial state: zi = [(1-alpha)*x[0]]
+    # gives y[0] = alpha*x[0] + (1-alpha)*x[0] = x[0].
+    zi = np.array([(1.0 - alpha) * x[0]])
+    out, _ = lfilter([alpha], [1.0, -(1.0 - alpha)], x, zi=zi)
     return out
 
 
@@ -132,35 +177,42 @@ def rsi_wilder(close: np.ndarray, period: int = 14) -> np.ndarray:
     Returns an array the same length as close, with NaNs for early periods.
     """
     close = close.astype(float)
-    if len(close) < period + 2:
-        return np.full_like(close, np.nan, dtype=float)
+    n = len(close)
+    if n < period + 2:
+        return np.full(n, np.nan, dtype=float)
 
     delta = np.diff(close)
     gains = np.where(delta > 0, delta, 0.0)
     losses = np.where(delta < 0, -delta, 0.0)
 
-    rsi = np.full(close.shape, np.nan, dtype=float)
+    rsi = np.full(n, np.nan, dtype=float)
 
-    avg_gain = np.mean(gains[:period])
-    avg_loss = np.mean(losses[:period])
+    # Seed: SMA of first `period` values
+    avg_gain_seed = float(np.mean(gains[:period]))
+    avg_loss_seed = float(np.mean(losses[:period]))
 
     # First RSI value corresponds to close index = period
-    if avg_loss == 0:
+    if avg_loss_seed == 0:
         rsi[period] = 100.0
     else:
-        rs = avg_gain / avg_loss
-        rsi[period] = 100.0 - (100.0 / (1.0 + rs))
+        rsi[period] = 100.0 - 100.0 / (1.0 + avg_gain_seed / avg_loss_seed)
 
-    # Wilder smoothing
-    for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-        idx = i + 1  # gains[i] affects close[i+1]
-        if avg_loss == 0:
-            rsi[idx] = 100.0
-        else:
-            rs = avg_gain / avg_loss
-            rsi[idx] = 100.0 - (100.0 / (1.0 + rs))
+    # Vectorized Wilder smoothing (alpha = 1/period) for gains[period:]
+    # Direct Form II transposed zi: zi = [(1-alpha)*seed] initialises the filter
+    # so that the first output equals Wilder(seed, gains[period]).
+    gains_tail = gains[period:]
+    losses_tail = losses[period:]
+    if len(gains_tail) > 0:
+        alpha = 1.0 / period
+        zi_g = np.array([(1.0 - alpha) * avg_gain_seed])
+        zi_l = np.array([(1.0 - alpha) * avg_loss_seed])
+        avg_gains, _ = lfilter([alpha], [1.0, -(1.0 - alpha)], gains_tail, zi=zi_g)
+        avg_losses, _ = lfilter([alpha], [1.0, -(1.0 - alpha)], losses_tail, zi=zi_l)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            rs = np.where(avg_losses != 0, avg_gains / avg_losses, np.inf)
+            rsi[period + 1: period + 1 + len(gains_tail)] = np.where(
+                avg_losses == 0, 100.0, 100.0 - 100.0 / (1.0 + rs)
+            )
 
     return rsi
 
@@ -177,16 +229,24 @@ def atr_wilder(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int
     if n < period + 1:
         return atr
 
-    tr = np.full(n, np.nan, dtype=float)
+    tr = np.empty(n, dtype=float)
     tr[0] = high[0] - low[0]
     hl = high[1:] - low[1:]
     hc = np.abs(high[1:] - close[:-1])
     lc = np.abs(low[1:] - close[:-1])
     tr[1:] = np.maximum(hl, np.maximum(hc, lc))
 
-    atr[period] = float(np.mean(tr[1 : period + 1]))
-    for i in range(period + 1, n):
-        atr[i] = (atr[i - 1] * (period - 1) + tr[i]) / period
+    # Seed: SMA of tr[1..period]
+    seed = float(np.mean(tr[1: period + 1]))
+    atr[period] = seed
+
+    # Vectorized Wilder smoothing (alpha = 1/period) for tr[period+1:]
+    tr_tail = tr[period + 1:]
+    if len(tr_tail) > 0:
+        alpha = 1.0 / period
+        zi = np.array([(1.0 - alpha) * seed])
+        atr_tail, _ = lfilter([alpha], [1.0, -(1.0 - alpha)], tr_tail, zi=zi)
+        atr[period + 1:] = atr_tail
 
     return atr
 
@@ -269,25 +329,13 @@ def monthly_closes(dates: np.ndarray, closes: np.ndarray) -> tuple[np.ndarray, n
     if len(dates) == 0:
         return np.array([], dtype=np.int32), np.array([], dtype=float)
 
-    months: list[int] = []
-    vals: list[float] = []
-
-    current_month = None
-    current_close = None
-    for di, ci in zip(dates, closes):
-        mk = month_key(int(di))
-        if mk != current_month:
-            if current_month is not None:
-                months.append(int(current_month))
-                vals.append(float(current_close))
-            current_month = mk
-        current_close = float(ci)
-
-    if current_month is not None:
-        months.append(int(current_month))
-        vals.append(float(current_close))
-
-    return np.array(months, dtype=np.int32), np.array(vals, dtype=float)
+    dates_int = dates.astype(np.int32)
+    # YYYYMM for each date
+    month_keys_arr = (dates_int // 10000) * 100 + (dates_int // 100) % 100
+    # Last index for each unique month (dates are sorted, so searchsorted gives last occurrence)
+    unique_months = np.unique(month_keys_arr)
+    last_indices = np.searchsorted(month_keys_arr, unique_months, side="right") - 1
+    return unique_months, closes[last_indices].astype(float)
 
 
 # -----------------------------
@@ -403,13 +451,41 @@ ALPHAVANTAGE_IPO_URL = "https://www.alphavantage.co/query"
 ALPHAVANTAGE_API_KEY = "F7HUZ9ETATI052FB"
 UPCOMING_IPOS_SHEET_NAME = "Upcoming IPOs (60D)"
 UPCOMING_EARNINGS_SHEET_NAME = "Upcoming Earnings (14D)"
-PROTECTED_SHEET_NAMES = {"Single Tickers", UPCOMING_IPOS_SHEET_NAME, UPCOMING_EARNINGS_SHEET_NAME}
+TOP10_OHLC_SHEET_NAME = "Top 10 OHLC Tracking"
+TOP10_OHLC_HIDDEN_COLUMNS = ("F", "G", "H", "M", "P")
+TOP10_OHLC_TRAILING_HIDDEN_COLUMNS = ("R",)
+PROTECTED_SHEET_NAMES = {
+    "Single Tickers",
+    UPCOMING_IPOS_SHEET_NAME,
+    UPCOMING_EARNINGS_SHEET_NAME,
+    TOP10_OHLC_SHEET_NAME,
+}
 
 
 def _format_mmddyyyy(d: date | None) -> str:
     if not d:
         return ""
     return d.strftime("%m/%d/%Y")
+
+
+def _fetch_nasdaq_day(day: date, session: requests.Session) -> tuple[date, list[dict[str, Any]]]:
+    """Fetch Nasdaq earnings calendar rows for a single day (no caching)."""
+    try:
+        resp = session.get(
+            NASDAQ_EARNINGS_URL,
+            params={"date": day.isoformat()},
+            headers=NASDAQ_HEADERS,
+            timeout=20,
+        )
+        if resp.status_code != 200:
+            return day, []
+        payload = resp.json()
+    except Exception:
+        return day, []
+
+    data = payload.get("data") if isinstance(payload, dict) else None
+    rows = data.get("rows") if isinstance(data, dict) else None
+    return day, (rows if isinstance(rows, list) else [])
 
 
 def _nasdaq_calendar_rows(
@@ -420,27 +496,7 @@ def _nasdaq_calendar_rows(
     cached = cache.get(day)
     if cached is not None:
         return cached
-
-    try:
-        resp = session.get(
-            NASDAQ_EARNINGS_URL,
-            params={"date": day.isoformat()},
-            headers=NASDAQ_HEADERS,
-            timeout=20,
-        )
-        if resp.status_code != 200:
-            cache[day] = []
-            return []
-        payload = resp.json()
-    except Exception:
-        cache[day] = []
-        return []
-
-    data = payload.get("data") if isinstance(payload, dict) else None
-    rows = data.get("rows") if isinstance(data, dict) else None
-    if not isinstance(rows, list):
-        rows = []
-
+    _, rows = _fetch_nasdaq_day(day, session)
     cache[day] = rows
     return rows
 
@@ -467,44 +523,40 @@ def fetch_nasdaq_earnings_dates(
     if not target:
         return {}
 
+    # All weekdays in [today-max_days, today+max_days]
+    all_days = [
+        today + timedelta(days=i)
+        for i in range(-max_days, max_days + 1)
+        if (today + timedelta(days=i)).weekday() < 5
+    ]
+
+    # Fetch all days in parallel (I/O-bound → threads)
+    with ThreadPoolExecutor(max_workers=20) as ex:
+        day_data: dict[date, list[dict[str, Any]]] = dict(
+            ex.map(lambda d: _fetch_nasdaq_day(d, session), all_days)
+        )
+
     last_dates: dict[str, date] = {}
     next_dates: dict[str, date] = {}
     company_names: dict[str, str] = {}
-    cache: dict[date, list[dict[str, Any]]] = {}
 
-    # Scan forward for next earnings date
-    for offset in range(0, max_days + 1):
-        day = today + timedelta(days=offset)
-        if day.weekday() >= 5:
-            continue
-        rows = _nasdaq_calendar_rows(day, session, cache)
+    for day, rows in day_data.items():
         for row in rows:
             sym = str(row.get("symbol", "")).strip().upper()
-            if sym in target and sym not in next_dates:
-                next_dates[sym] = day
-            if sym in target and sym not in company_names:
+            if sym not in target:
+                continue
+            if sym not in company_names:
                 name = _extract_company_name(row)
                 if name:
                     company_names[sym] = name
-        if len(next_dates) == len(target):
-            break
-
-    # Scan backward for last earnings date
-    for offset in range(0, max_days + 1):
-        day = today - timedelta(days=offset)
-        if day.weekday() >= 5:
-            continue
-        rows = _nasdaq_calendar_rows(day, session, cache)
-        for row in rows:
-            sym = str(row.get("symbol", "")).strip().upper()
-            if sym in target and sym not in last_dates:
-                last_dates[sym] = day
-            if sym in target and sym not in company_names:
-                name = _extract_company_name(row)
-                if name:
-                    company_names[sym] = name
-        if len(last_dates) == len(target):
-            break
+            # Earliest future date → next earnings
+            if day >= today:
+                if sym not in next_dates or day < next_dates[sym]:
+                    next_dates[sym] = day
+            # Most recent past date → last earnings
+            else:
+                if sym not in last_dates or day > last_dates[sym]:
+                    last_dates[sym] = day
 
     out: dict[str, dict[str, str]] = {}
     for sym in target:
@@ -527,13 +579,21 @@ def fetch_nasdaq_upcoming_earnings(
     if end_date < start_date:
         return []
 
+    all_days = [
+        start_date + timedelta(days=i)
+        for i in range((end_date - start_date).days + 1)
+    ]
+
+    # Fetch all days in parallel
+    with ThreadPoolExecutor(max_workers=20) as ex:
+        day_data: dict[date, list[dict[str, Any]]] = dict(
+            ex.map(lambda d: _fetch_nasdaq_day(d, session), all_days)
+        )
+
     rows: list[dict[str, Any]] = []
     seen: set[tuple[str, date]] = set()
-    cache: dict[date, list[dict[str, Any]]] = {}
-    days = (end_date - start_date).days
-    for offset in range(days + 1):
-        earnings_date = start_date + timedelta(days=offset)
-        for row in _nasdaq_calendar_rows(earnings_date, session, cache):
+    for earnings_date in all_days:
+        for row in day_data.get(earnings_date, []):
             symbol = str(row.get("symbol", "")).strip().upper()
             if not symbol:
                 continue
@@ -989,6 +1049,353 @@ def collect_qualified_result_dates(
                 qualified_dates[sym] = current_date
 
     return qualified_dates
+
+
+def _coerce_date(value: Any) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value).strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d %b %Y"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except Exception:
+            continue
+    return None
+
+
+def _coerce_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return int(float(value))
+    except Exception:
+        return None
+
+
+def _coerce_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        out = float(value)
+    except Exception:
+        return None
+    return out if np.isfinite(out) else None
+
+
+def collect_top_ranked_cohorts(wb: Workbook, top_n: int = 10) -> list[dict[str, Any]]:
+    """
+    Read workbook run sheets and return ranked ticker cohorts for OHLC tracking.
+    """
+    cohorts: list[dict[str, Any]] = []
+    run_sheets_by_date: dict[date, str] = {}
+    for name in wb.sheetnames:
+        if name in PROTECTED_SHEET_NAMES:
+            continue
+        rank_date = _parse_run_sheet_date(name)
+        if rank_date is None:
+            continue
+        # If a workbook has duplicate run sheets for the same date, use the last
+        # one in workbook order and avoid double-counting its top ranked tickers.
+        run_sheets_by_date[rank_date] = name
+
+    seen_cohorts: set[tuple[date, int, str]] = set()
+    for rank_date, name in run_sheets_by_date.items():
+        ws = wb[name]
+        if is_empty_sheet(ws) or ws.max_row < 3:
+            continue
+
+        headers = [
+            str(cell.value).strip().lower() if cell.value is not None else ""
+            for cell in ws[1]
+        ]
+        try:
+            rank_idx = headers.index("rank")
+        except ValueError:
+            continue
+        close_idx = next(
+            (idx for idx, header in enumerate(headers) if "close" in header and "$" in header),
+            None,
+        )
+        if close_idx is None:
+            continue
+
+        for row in ws.iter_rows(min_row=3, values_only=True):
+            rank = _coerce_int(row[rank_idx] if rank_idx < len(row) else None)
+            if rank is None or rank < 1 or rank > top_n:
+                continue
+            symbol = str(row[0] if row and row[0] is not None else "").strip().upper()
+            if not symbol:
+                continue
+            cohort_key = (rank_date, rank, symbol)
+            if cohort_key in seen_cohorts:
+                continue
+            seen_cohorts.add(cohort_key)
+            cohorts.append(
+                {
+                    "rank_date": rank_date,
+                    "rank": rank,
+                    "symbol": symbol,
+                    "rank_close": _coerce_float(row[close_idx] if close_idx < len(row) else None),
+                }
+            )
+
+    cohorts.sort(key=lambda r: (r["rank_date"], int(r["rank"]), str(r["symbol"])))
+    return cohorts
+
+
+def build_top10_ohlc_tracking_rows(
+    cohorts: list[dict[str, Any]],
+    symbol_paths: dict[str, Path],
+    root: Path,
+    follow_days: int = 5,
+) -> list[list[Any]]:
+    rows: list[list[Any]] = []
+    ohlc_cache: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
+
+    def pct_vs_rank(value: float, rank_close: float | None) -> float | None:
+        if rank_close is None or rank_close == 0:
+            return None
+        return float(f"{pct_change(value, rank_close):.2f}")
+
+    for cohort in cohorts:
+        symbol = str(cohort["symbol"]).strip().upper()
+        normalized = normalize_symbol(symbol)
+        path = symbol_paths.get(normalized)
+        if path is None:
+            path = find_symbol_file(root, normalized)
+        if path is None:
+            continue
+
+        if normalized not in ohlc_cache:
+            ohlc_cache[normalized] = load_ohlc_from_file(path)
+        dates, opens, highs, lows, closes = ohlc_cache[normalized]
+        if len(dates) == 0:
+            continue
+
+        rank_date = cohort["rank_date"]
+        rank_int = date_to_int(rank_date)
+        start_idx = int(np.searchsorted(dates, rank_int, side="right"))
+        rank_close = _coerce_float(cohort.get("rank_close"))
+        for offset, idx in enumerate(range(start_idx, min(start_idx + follow_days, len(dates))), start=1):
+            open_val = float(opens[idx])
+            high_val = float(highs[idx])
+            low_val = float(lows[idx])
+            close_val = float(closes[idx])
+            hit_target = ""
+            hit_stop = ""
+            if rank_close is not None:
+                hit_target = "Yes" if high_val >= rank_close * 1.02 else "No"
+                hit_stop = "Yes" if low_val <= rank_close * 0.99 else "No"
+            rows.append(
+                [
+                    rank_date,
+                    int(cohort["rank"]),
+                    symbol,
+                    offset,
+                    date_from_int(int(dates[idx])),
+                    open_val,
+                    high_val,
+                    low_val,
+                    close_val,
+                    rank_close,
+                    high_val,
+                    pct_vs_rank(high_val, rank_close),
+                    pct_vs_rank(low_val, rank_close),
+                    pct_vs_rank(close_val, rank_close),
+                    hit_target,
+                    hit_stop,
+                ]
+            )
+
+    return rows
+
+
+def write_top10_ohlc_tracking_sheet(
+    wb: Workbook,
+    symbol_paths: dict[str, Path],
+    root: Path,
+    top_n: int = 10,
+) -> None:
+    cohorts = collect_top_ranked_cohorts(wb, top_n=top_n)
+    refresh_dates = {cohort["rank_date"] for cohort in cohorts}
+    headers = [
+        "Rank Date",
+        "Rank",
+        "Symbol",
+        "Days Since Rank",
+        "Date",
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "Rank Close",
+        "Tracking Day High",
+        "High vs Initial Rank Close %",
+        "Low vs Rank Close %",
+        "Close vs Initial Rank Close %",
+        "Hit +2%?",
+        "Hit -1%?",
+        "VV",
+    ]
+
+    preserved_rows: list[list[Any]] = []
+    preserved_row_keys: set[tuple[Any, ...]] = set()
+    if TOP10_OHLC_SHEET_NAME in wb.sheetnames:
+        ws = wb[TOP10_OHLC_SHEET_NAME]
+        existing_headers = [str(cell.value or "").strip() for cell in ws[1]]
+        existing_header_map = {header: idx for idx, header in enumerate(existing_headers) if header}
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            rank_date = _coerce_date(row[0] if row else None)
+            if rank_date is not None and rank_date in refresh_dates:
+                continue
+            if any(value is not None for value in row):
+                preserved_row = [
+                    row[existing_header_map[header]]
+                    if header in existing_header_map and existing_header_map[header] < len(row)
+                    else None
+                    for header in headers
+                ]
+                row_key = tuple(preserved_row[:5])
+                if row_key in preserved_row_keys:
+                    continue
+                preserved_row_keys.add(row_key)
+                preserved_rows.append(preserved_row)
+        ws.delete_rows(1, ws.max_row)
+    else:
+        ws = wb.create_sheet(title=TOP10_OHLC_SHEET_NAME)
+
+    ws.append(headers)
+    for row in preserved_rows:
+        ws.append(row + [""] * (len(headers) - len(row)))
+    for row in build_top10_ohlc_tracking_rows(cohorts, symbol_paths, root):
+        ws.append(row)
+
+    tracking_day_high_col = headers.index("Tracking Day High") + 1
+    high_col = headers.index("High") + 1
+    for row_idx in range(2, ws.max_row + 1):
+        tracking_day_high_cell = ws.cell(row=row_idx, column=tracking_day_high_col)
+        if tracking_day_high_cell.value in (None, ""):
+            tracking_day_high_cell.value = ws.cell(row=row_idx, column=high_col).value
+
+    header_fill = PatternFill(fill_type="solid", fgColor=Color(indexed=8))
+    header_font = Font(name="Calibri", size=11, bold=True, color=Color(indexed=9))
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    data_align = Alignment(horizontal="center", vertical="center")
+    hit_target_fill = PatternFill(fill_type="solid", fgColor="C6EFCE")
+    hit_target_vertical_border = Side(style="thin", color="A6A6A6")
+    date_group_border = Side(style="thick", color="808080")
+    for col_idx in range(1, len(headers) + 1):
+        cell = ws.cell(row=1, column=col_idx)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = header_align
+
+    success_label_cell = ws["S1"]
+    success_label_cell.value = "Next-Day +2% Success Rate"
+    success_label_cell.fill = header_fill
+    success_label_cell.font = header_font
+    success_label_cell.alignment = header_align
+
+    success_rate_cell = ws["T1"]
+    success_rate_cell.value = '=IFERROR(COUNTIFS($D:$D,1,$O:$O,"Yes")/COUNTIFS($D:$D,1,$O:$O,"<>"),"")'
+    success_rate_cell.fill = header_fill
+    success_rate_cell.font = header_font
+    success_rate_cell.alignment = header_align
+    success_rate_cell.number_format = "0.00%"
+
+    data_last_row = max(ws.max_row, 2)
+    overall_success_label_cell = ws["U1"]
+    overall_success_label_cell.value = "Overall +2% Success Rate"
+    overall_success_label_cell.fill = header_fill
+    overall_success_label_cell.font = header_font
+    overall_success_label_cell.alignment = header_align
+
+    overall_success_rate_cell = ws["V1"]
+    overall_success_rate_cell.value = (
+        f'=IFERROR(LET(keys,$A$2:$A${data_last_row}&"|"&$B$2:$B${data_last_row}&"|"&$C$2:$C${data_last_row},'
+        f'valid,$O$2:$O${data_last_row}<>"",'
+        f'uniqueKeys,UNIQUE(FILTER(keys,valid)),'
+        f'hits,IFERROR(UNIQUE(FILTER(keys,$O$2:$O${data_last_row}="Yes")),""),'
+        f'SUM(--ISNUMBER(XMATCH(uniqueKeys,hits)))/ROWS(uniqueKeys)),"")'
+    )
+    overall_success_rate_cell.fill = header_fill
+    overall_success_rate_cell.font = header_font
+    overall_success_rate_cell.alignment = header_align
+    overall_success_rate_cell.number_format = "0.00%"
+
+    pct_literal_format = '0.00"%"'
+    date_cols = {1, 5}
+    price_cols = {6, 7, 8, 9, 10, 11}
+    pct_cols = {12, 13, 14}
+    previous_rank_date = None
+    for row_idx in range(2, ws.max_row + 1):
+        for col_idx in range(1, len(headers) + 1):
+            ws.cell(row=row_idx, column=col_idx).alignment = data_align
+        hit_target = ws.cell(row=row_idx, column=15).value
+        if isinstance(hit_target, str) and hit_target.strip().lower() == "yes":
+            for col_idx in range(1, len(headers) + 1):
+                cell = ws.cell(row=row_idx, column=col_idx)
+                cell.fill = hit_target_fill
+                cell.border = Border(
+                    left=hit_target_vertical_border,
+                    right=hit_target_vertical_border,
+                    top=cell.border.top,
+                    bottom=cell.border.bottom,
+                    diagonal=cell.border.diagonal,
+                    diagonal_direction=cell.border.diagonal_direction,
+                    diagonalUp=cell.border.diagonalUp,
+                    diagonalDown=cell.border.diagonalDown,
+                    outline=cell.border.outline,
+                    vertical=cell.border.vertical,
+                    horizontal=cell.border.horizontal,
+                )
+        for col_idx in date_cols:
+            ws.cell(row=row_idx, column=col_idx).number_format = "mmm d, yyyy"
+        for col_idx in price_cols:
+            ws.cell(row=row_idx, column=col_idx).number_format = '"$"#,##0.00'
+        for col_idx in pct_cols:
+            ws.cell(row=row_idx, column=col_idx).number_format = pct_literal_format
+        rank_date = ws.cell(row=row_idx, column=1).value
+        if previous_rank_date is not None and rank_date != previous_rank_date:
+            for col_idx in range(1, len(headers) + 1):
+                cell = ws.cell(row=row_idx, column=col_idx)
+                cell.border = Border(
+                    left=cell.border.left,
+                    right=cell.border.right,
+                    top=date_group_border,
+                    bottom=cell.border.bottom,
+                    diagonal=cell.border.diagonal,
+                    diagonal_direction=cell.border.diagonal_direction,
+                    diagonalUp=cell.border.diagonalUp,
+                    diagonalDown=cell.border.diagonalDown,
+                    outline=cell.border.outline,
+                    vertical=cell.border.vertical,
+                    horizontal=cell.border.horizontal,
+                )
+        previous_rank_date = rank_date
+
+    for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+        for cell in row:
+            cell.alignment = header_align if cell.row == 1 else data_align
+
+    ws.freeze_panes = "A2"
+    auto_size_columns(ws, min_width=9, max_width=22)
+    for col_idx in range(1, len(headers) + 1):
+        ws.column_dimensions[get_column_letter(col_idx)].hidden = False
+    # Set to an empty tuple to show all OHLC tracking columns again.
+    for col_letter in TOP10_OHLC_HIDDEN_COLUMNS:
+        ws.column_dimensions[col_letter].hidden = True
+    # Excel always has additional blank columns; keep the first trailing one out of view.
+    for col_letter in TOP10_OHLC_TRAILING_HIDDEN_COLUMNS:
+        ws.column_dimensions[col_letter].hidden = True
 
 
 def prune_old_run_sheets(
@@ -1866,7 +2273,12 @@ def main() -> None:
         print(f"Wrote single ticker to {out_path} (Single Tickers)")
         return
 
-    for row in sorted(results, key=lambda x: str(x["symbol"])):
+    def daily_result_sort_key(row: dict[str, Any]) -> tuple[bool, int, str]:
+        rank = _coerce_int(row.get("rank")) if args.score_enable else None
+        symbol = str(row.get("symbol", "")).strip().upper()
+        return (rank is None, rank if rank is not None else 0, symbol)
+
+    for row in sorted(results, key=daily_result_sort_key):
         symbol_display = str(row.get("symbol", "")).strip()
         symbol_key = symbol_display.upper()
         prev_count = int(prev_counts.get(symbol_key, 0))
@@ -2077,7 +2489,8 @@ def main() -> None:
     earnings_end = earnings_start + timedelta(days=14)
     earnings_rows = fetch_nasdaq_upcoming_earnings(session, earnings_start, earnings_end)
     write_upcoming_earnings_sheet(wb, earnings_rows, earnings_start, earnings_end, qualified_dates)
-    prune_old_run_sheets(wb, keep_runs=7)
+    write_top10_ohlc_tracking_sheet(wb, symbol_paths, root, top_n=10)
+    prune_old_run_sheets(wb, keep_runs=15)
 
     wb.save(out_path)
 
