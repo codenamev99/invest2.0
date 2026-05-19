@@ -1165,6 +1165,26 @@ def build_top10_ohlc_tracking_rows(
             return None
         return float(f"{pct_change(value, rank_close):.2f}")
 
+    def first_threshold_hit(open_val: float, high_val: float, low_val: float, rank_close: float | None) -> str:
+        if rank_close is None:
+            return ""
+        target = rank_close * 1.02
+        stop = rank_close * 0.99
+        if open_val >= target:
+            return "+2% first"
+        if open_val <= stop:
+            return "-1% first"
+
+        hit_target = high_val >= target
+        hit_stop = low_val <= stop
+        if hit_target and hit_stop:
+            return "Both - order unknown"
+        if hit_target:
+            return "+2% first"
+        if hit_stop:
+            return "-1% first"
+        return "Neither"
+
     for cohort in cohorts:
         symbol = str(cohort["symbol"]).strip().upper()
         normalized = normalize_symbol(symbol)
@@ -1212,6 +1232,7 @@ def build_top10_ohlc_tracking_rows(
                     pct_vs_rank(close_val, rank_close),
                     hit_target,
                     hit_stop,
+                    first_threshold_hit(open_val, high_val, low_val, rank_close),
                 ]
             )
 
@@ -1243,6 +1264,7 @@ def write_top10_ohlc_tracking_sheet(
         "Close vs Initial Rank Close %",
         "Hit +2%?",
         "Hit -1%?",
+        "First Hit",
         "VV",
     ]
 
@@ -1743,6 +1765,17 @@ def main() -> None:
         default=0,
         help="Parallel workers for symbol screening (0=auto, 1=disable parallelism)",
     )
+    ap.add_argument(
+        "--run_mode",
+        choices=["all", "single"],
+        default="",
+        help="Run mode for unattended use. Omit to show the interactive menu.",
+    )
+    ap.add_argument(
+        "--single_symbol",
+        default="",
+        help="Ticker to screen when --run_mode single is used, e.g. AAPL or AAPL.US.",
+    )
 
     # Average daily dollar volume filter (close * volume)
     ap.add_argument(
@@ -1775,7 +1808,13 @@ def main() -> None:
     if args.atr_min_pct < 0:
         raise SystemExit("--atr_min_pct must be >= 0")
 
-    run_mode, single_symbol = prompt_run_mode()
+    if args.run_mode:
+        run_mode = args.run_mode
+        single_symbol = normalize_symbol(args.single_symbol) if args.single_symbol else None
+        if run_mode == "single" and not single_symbol:
+            raise SystemExit("--single_symbol is required when --run_mode single is used.")
+    else:
+        run_mode, single_symbol = prompt_run_mode()
 
     root = resolve_path(args.root)
     out_path = resolve_path(args.out)

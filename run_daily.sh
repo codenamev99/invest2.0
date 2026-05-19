@@ -20,8 +20,9 @@ if [ -f ".venv/bin/activate" ]; then
 fi
 
 # -------- Configuration --------
-# Set this to your Stooq download path if you want auto refresh
-STOOQ_SRC="/Users/v/Downloads/data"
+# Preferred: set POLYGON_API_KEY in your shell or scheduler to auto-refresh from Polygon.
+# Optional fallback: set this to your Stooq download path if you still want manual Stooq refresh.
+STOOQ_SRC=""
 STOOQ_MODE="move"
 DATA_DEST="$PROJECT_DIR/data 2"
 TICKERS_FILE="$PROJECT_DIR/nyse_tickers.csv"
@@ -30,10 +31,12 @@ ROOT_DATA="$PROJECT_DIR/data 2/daily/us"
 BENCHMARK="SPY.US"
 
 # -------- Daily Steps --------
-if [ -n "$STOOQ_SRC" ]; then
+if [ -n "${POLYGON_API_KEY:-}" ]; then
+  $PYTHON_CMD refresh_polygon_daily.py --root "$ROOT_DATA"
+elif [ -n "$STOOQ_SRC" ]; then
   $PYTHON_CMD refresh_stooq_dump.py --src "$STOOQ_SRC" --dest "$DATA_DEST" --mode "$STOOQ_MODE"
 else
-  echo "Skipping data refresh. Set STOOQ_SRC in run_daily.sh to enable."
+  echo "Skipping data refresh. Set POLYGON_API_KEY or STOOQ_SRC in run_daily.sh to enable."
 fi
 
 if [ -f "requirements.txt" ]; then
@@ -42,6 +45,6 @@ fi
 
 $PYTHON_CMD generate_tickers.py --dir "$ROOT_DATA/nyse stocks" --out "$TICKERS_FILE"
 
-$PYTHON_CMD screen_stooq.py --tickers "$TICKERS_FILE" --root "$ROOT_DATA" --benchmark "$BENCHMARK" --out "$RESULTS_FILE"
+$PYTHON_CMD screen_stooq.py --run_mode all --tickers "$TICKERS_FILE" --root "$ROOT_DATA" --benchmark "$BENCHMARK" --out "$RESULTS_FILE"
 
 echo "Done."

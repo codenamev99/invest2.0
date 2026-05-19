@@ -20,7 +20,8 @@ if exist ".venv\Scripts\activate.bat" (
 )
 
 rem -------- Configuration --------
-rem Stooq US daily (txt) on Windows is usually named d_us_txt (.zip) or extracted folder d_us_txt with daily\ inside.
+rem Preferred: set POLYGON_API_KEY in your user environment or Task Scheduler to auto-refresh from Polygon.
+rem Optional fallback: Stooq US daily (txt) is usually named d_us_txt (.zip) or extracted folder d_us_txt with daily\ inside.
 rem Set STOOQ_SRC to that folder or zip, e.g. C:\Users\YourName\Downloads\d_us_txt  or  ...\d_us_txt.zip
 rem Use a real Windows path — NOT /Users/... (Python maps that to C:\Users\... and breaks if that user does not exist).
 rem Leave empty to skip refresh (you must already have data under DATA_DEST, see below).
@@ -34,14 +35,20 @@ set "ROOT_DATA=%PROJECT_DIR%data 2\daily\us"
 set "BENCHMARK=SPY.US"
 
 rem -------- Daily Steps --------
-if not "%STOOQ_SRC%"=="" (
+if not "%POLYGON_API_KEY%"=="" (
+    %PYTHON_CMD% refresh_polygon_daily.py --root "%ROOT_DATA%"
+    if errorlevel 1 (
+        echo ERROR: refresh_polygon_daily.py failed. Check POLYGON_API_KEY and your data path, then retry.
+        exit /b 1
+    )
+) else if not "%STOOQ_SRC%"=="" (
     %PYTHON_CMD% refresh_stooq_dump.py --src "%STOOQ_SRC%" --dest "%DATA_DEST%" --mode "%STOOQ_MODE%"
     if errorlevel 1 (
         echo ERROR: refresh_stooq_dump.py failed. Fix STOOQ_SRC or your data path, then retry.
         exit /b 1
     )
 ) else (
-    echo Skipping data refresh. Set STOOQ_SRC in run_daily.bat to enable, or copy data into: "%DATA_DEST%"
+    echo Skipping data refresh. Set POLYGON_API_KEY or STOOQ_SRC in run_daily.bat to enable, or copy data into: "%DATA_DEST%"
 )
 
 if exist "requirements.txt" (
@@ -60,7 +67,7 @@ if not exist "%ROOT_DATA%\nyse stocks" (
 %PYTHON_CMD% generate_tickers.py --dir "%ROOT_DATA%\nyse stocks" --out "%TICKERS_FILE%"
 if errorlevel 1 exit /b 1
 
-%PYTHON_CMD% screen_stooq.py --tickers "%TICKERS_FILE%" --root "%ROOT_DATA%" --benchmark "%BENCHMARK%" --out "%RESULTS_FILE%"
+%PYTHON_CMD% screen_stooq.py --run_mode all --tickers "%TICKERS_FILE%" --root "%ROOT_DATA%" --benchmark "%BENCHMARK%" --out "%RESULTS_FILE%"
 if errorlevel 1 exit /b 1
 
 echo Done.
