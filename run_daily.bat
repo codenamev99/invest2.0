@@ -33,9 +33,18 @@ set "TICKERS_FILE=%PROJECT_DIR%nyse_tickers.csv"
 set "RESULTS_FILE=%PROJECT_DIR%results.xlsx"
 set "ROOT_DATA=%PROJECT_DIR%data 2\daily\us"
 set "BENCHMARK=SPY.US"
+if "%POLYGON_BOOTSTRAP_YEARS%"=="" set "POLYGON_BOOTSTRAP_YEARS=2"
 
 rem -------- Daily Steps --------
 if not "%POLYGON_API_KEY%"=="" (
+    if not exist "%ROOT_DATA%\nyse stocks" (
+        echo NYSE data folder missing; bootstrapping %POLYGON_BOOTSTRAP_YEARS% years from Polygon.
+        %PYTHON_CMD% refresh_polygon_daily.py --bootstrap --root "%ROOT_DATA%" --bootstrap-years "%POLYGON_BOOTSTRAP_YEARS%"
+        if errorlevel 1 (
+            echo ERROR: Polygon bootstrap failed. Check POLYGON_API_KEY, plan history, and rate limits.
+            exit /b 1
+        )
+    )
     %PYTHON_CMD% refresh_polygon_daily.py --root "%ROOT_DATA%"
     if errorlevel 1 (
         echo ERROR: refresh_polygon_daily.py failed. Check POLYGON_API_KEY and your data path, then retry.

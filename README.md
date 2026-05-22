@@ -26,7 +26,15 @@ PowerShell example:
 [Environment]::SetEnvironmentVariable("POLYGON_API_KEY", "your_key_here", "User")
 ```
 
-The Polygon updater appends or updates the latest daily bar for symbols that already exist under your data folder. Keep an initial Stooq-style data folder in place, then Polygon can maintain it day to day.
+The Polygon updater can bootstrap a missing `data 2` folder from Polygon daily bars, then append or update the latest daily bar on later runs. On the free tier, the first bootstrap is slow because the script sleeps between daily requests to stay within rate limits.
+
+Optional Polygon variables:
+```
+set "POLYGON_BOOTSTRAP_YEARS=2"
+set "POLYGON_RATE_LIMIT_SLEEP=13"
+```
+
+`POLYGON_BOOTSTRAP_YEARS=2` matches the approximate free-tier history window. Shorten it if you only need enough data for indicators and want a faster first run.
 
 Optional fallback: download Stooq manually.
 
@@ -84,6 +92,7 @@ From the PyCharm Terminal (project root). In **PowerShell** use:
 In **cmd.exe**, `run_daily.bat` also works.
 
 This will:
+- Bootstrap missing Polygon history if `POLYGON_API_KEY` is set and `data 2` is missing
 - Refresh from Polygon if `POLYGON_API_KEY` is set, otherwise copy/refresh Stooq data if `STOOQ_SRC` is set
 - Install requirements (if needed)
 - Generate `nyse_tickers.csv`
