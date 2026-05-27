@@ -456,6 +456,7 @@ UPCOMING_IPOS_SHEET_NAME = "Upcoming IPOs (60D)"
 UPCOMING_EARNINGS_SHEET_NAME = "Upcoming Earnings (14D)"
 TOP10_OHLC_SHEET_NAME = "Top 10 OHLC Tracking"
 INVESTMENT_DASHBOARD_SHEET_NAME = "Investment Dashboard"
+SUMMARY_SHEET_NAME = "Summary"
 TOP10_OHLC_HIDDEN_COLUMNS = ("F", "G", "H", "M", "P")
 TOP10_OHLC_TRAILING_HIDDEN_COLUMNS = ("R",)
 PROTECTED_SHEET_NAMES = {
@@ -464,6 +465,7 @@ PROTECTED_SHEET_NAMES = {
     UPCOMING_EARNINGS_SHEET_NAME,
     TOP10_OHLC_SHEET_NAME,
     INVESTMENT_DASHBOARD_SHEET_NAME,
+    SUMMARY_SHEET_NAME,
 }
 
 
@@ -471,6 +473,16 @@ def _format_mmddyyyy(d: date | None) -> str:
     if not d:
         return ""
     return d.strftime("%m/%d/%Y")
+
+
+def _trading_days_open(entry_date: date | None, exit_date: date | None) -> int | None:
+    if not entry_date or not exit_date or exit_date < entry_date:
+        return None
+    return sum(
+        1
+        for offset in range(1, (exit_date - entry_date).days + 1)
+        if (entry_date + timedelta(days=offset)).weekday() < 5
+    )
 
 
 def _fetch_nasdaq_day(day: date, session: requests.Session) -> tuple[date, list[dict[str, Any]]]:
@@ -1877,6 +1889,172 @@ def write_investment_dashboard_sheet(
     ws.freeze_panes = f"A{table_header_row + 1}"
     auto_size_columns(ws, min_width=10, max_width=35)
     ws.column_dimensions["B"].width = 18
+    write_summary_sheet(wb, simulation_rows)
+
+
+def write_summary_sheet(wb: Workbook, simulation_rows: list[dict[str, Any]]) -> None:
+    if SUMMARY_SHEET_NAME in wb.sheetnames:
+        ws = wb[SUMMARY_SHEET_NAME]
+        for merged_range in list(ws.merged_cells.ranges):
+            ws.unmerge_cells(str(merged_range))
+        ws.delete_rows(1, ws.max_row)
+    else:
+        insert_at = (
+            wb.sheetnames.index(INVESTMENT_DASHBOARD_SHEET_NAME)
+            if INVESTMENT_DASHBOARD_SHEET_NAME in wb.sheetnames
+            else len(wb.sheetnames)
+        )
+        ws = wb.create_sheet(title=SUMMARY_SHEET_NAME, index=insert_at)
+
+    headers = [
+        "Symbol",
+        "Rank \nDate",
+        "Entry \nDate",
+        "Entry\nPrice",
+        "Exit\nDate",
+        "Exit\nPrice",
+        "Result\n$",
+        "Result\n%",
+        "# of Days open",
+    ]
+    ws.append(headers)
+
+    summary_rows = []
+    for row in simulation_rows:
+        entry_date = row.get("entry_date")
+        exit_date = row.get("exit_date")
+        if not isinstance(entry_date, date):
+            entry_date = None
+        if not isinstance(exit_date, date):
+            exit_date = None
+        status = str(row.get("status", "")).strip()
+        is_closed = status == "Closed" or (not status and exit_date is not None)
+        summary_rows.append(
+            [
+                row.get("symbol"),
+                row.get("rank_date"),
+                entry_date,
+                row.get("entry_price"),
+                exit_date,
+                row.get("exit_price") if exit_date else None,
+                row.get("result_currency") if exit_date else None,
+                row.get("result_pct") if exit_date else None,
+                _trading_days_open(entry_date, exit_date) if is_closed else None,
+            ]
+        )
+
+    for output_row in summary_rows:
+        ws.append(output_row)
+
+    data_start_row = 2
+    data_end_row = data_start_row + len(summary_rows) - 1
+    total_label_row = data_end_row + 3 if summary_rows else 4
+    total_formula_row = total_label_row + 1
+    ws.cell(row=total_label_row, column=7, value="TOTAL")
+    ws.cell(row=total_label_row, column=8, value="TOTAL")
+    if summary_rows:
+        ws.cell(row=total_formula_row, column=7, value=f"=SUM(G{data_start_row}:G{data_end_row})")
+        ws.cell(row=total_formula_row, column=8, value=f"=SUM(H{data_start_row}:H{data_end_row})")
+    else:
+        ws.cell(row=total_formula_row, column=7, value=0)
+        ws.cell(row=total_formula_row, column=8, value=0)
+
+    black = Color(indexed=8)
+    white = Color(indexed=9)
+    light_gray = Color(rgb="D9D9D9")
+
+    black_fill = PatternFill(fill_type="solid", fgColor=black)
+    light_gray_fill = PatternFill(fill_type="solid", fgColor=light_gray)
+    white_fill = PatternFill(fill_type="solid", fgColor=white)
+    header_font = Font(name="Calibri", size=11, bold=True, color=white)
+    result_header_font = Font(name="Calibri", size=11, bold=True, color=black)
+    symbol_font = Font(name="Calibri", size=13, bold=True, color=black)
+    regular_font = Font(name="Calibri", size=11, color=black)
+    result_font = Font(name="Calibri", size=13, color=black)
+    total_font = Font(name="Calibri", size=13, bold=True, color=black)
+    center = Alignment(horizontal="center", vertical="center")
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    thin_black = Side(style="thin", color=black)
+    thin_light_gray = Side(style="thin", color=light_gray)
+    thick_black = Side(style="thick", color=black)
+
+    column_widths = {
+        "A": 9.0,
+        "B": 12.3125,
+        "C": 13.9531,
+        "D": 9.65625,
+        "E": 13.1953,
+        "F": 7.82812,
+        "G": 11.5391,
+        "H": 13.0,
+        "I": 13.0,
+    }
+    for col_letter, width in column_widths.items():
+        ws.column_dimensions[col_letter].width = width
+    ws.row_dimensions[1].height = 37.4
+    for row_idx in range(2, total_formula_row + 1):
+        ws.row_dimensions[row_idx].height = 19.05
+
+    date_format = "mmm d, yyyy"
+    currency_format = '"$"#,##0.00'
+    result_currency_format = '"$"#,##0.00_);[Red]("$"#,##0.00)'
+    result_pct_format = '0%_);[Red]\\(0%\\)'
+
+    def summary_border(col_idx: int, row_idx: int, include_top: bool, include_bottom: bool) -> Border:
+        left = thin_black
+        right = thin_black
+        if col_idx == 1:
+            left = thin_light_gray
+        if col_idx == 9:
+            right = thin_light_gray
+        if col_idx in {3, 5, 7, 9}:
+            left = thick_black
+        if col_idx in {2, 4, 6, 8}:
+            right = thick_black
+        top = thin_black if include_top else None
+        bottom = thin_black if include_bottom else None
+        if row_idx == total_formula_row and col_idx in {7, 8}:
+            bottom = thick_black
+        return Border(left=left, right=right, top=top, bottom=bottom)
+
+    for col_idx in range(1, 10):
+        cell = ws.cell(row=1, column=col_idx)
+        cell.fill = light_gray_fill if col_idx in {7, 8} else black_fill
+        cell.font = result_header_font if col_idx in {7, 8} else header_font
+        cell.alignment = header_align
+        cell.number_format = "@"
+        cell.border = summary_border(col_idx, 1, include_top=False, include_bottom=False)
+
+    for row_idx in range(2, total_formula_row + 1):
+        for col_idx in range(1, 10):
+            cell = ws.cell(row=row_idx, column=col_idx)
+            cell.fill = light_gray_fill if col_idx in {7, 8} else white_fill
+            cell.alignment = center
+            cell.font = regular_font
+            include_top = row_idx > 2 and row_idx <= max(data_end_row, 1)
+            include_bottom = row_idx <= max(data_end_row, 1)
+            if col_idx == 1:
+                cell.font = symbol_font
+                cell.number_format = "@"
+            elif col_idx in {2, 3, 5}:
+                cell.number_format = date_format
+            elif col_idx in {4, 6}:
+                cell.number_format = currency_format
+            elif col_idx == 7:
+                cell.font = total_font if row_idx == total_label_row else result_font
+                cell.number_format = "@" if row_idx == total_label_row else result_currency_format
+            elif col_idx == 8:
+                cell.font = total_font if row_idx == total_label_row else result_font
+                cell.number_format = "@" if row_idx == total_label_row else result_pct_format
+            else:
+                cell.number_format = "General"
+            if row_idx > data_end_row and row_idx not in {total_label_row, total_formula_row}:
+                include_top = row_idx == data_end_row + 1
+                include_bottom = False
+            cell.border = summary_border(col_idx, row_idx, include_top=include_top, include_bottom=include_bottom)
+
+    ws.freeze_panes = None
 
 
 def prune_old_run_sheets(
