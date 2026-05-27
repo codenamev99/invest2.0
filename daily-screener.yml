@@ -1,0 +1,61 @@
+name: Daily Screener
+
+on:
+  schedule:
+    # GitHub cron is UTC. Run at both possible 7am ET UTC offsets,
+    # then guard inside the job for the real America/New_York time.
+    - cron: "0 11,12 * * 0-4"
+  workflow_dispatch:
+
+jobs:
+  run-screener:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check local ET time
+        id: et_time
+        run: |
+          hour=$(TZ=America/New_York date +%H)
+          dow=$(TZ=America/New_York date +%u)
+          echo "hour=$hour" >> "$GITHUB_OUTPUT"
+          echo "dow=$dow" >> "$GITHUB_OUTPUT"
+
+      - name: Stop unless 7am ET Sunday-Thursday
+        if: ${{ steps.et_time.outputs.hour != '07' || steps.et_time.outputs.dow > '4' }}
+        run: |
+          echo "Not 7:00am ET Sunday-Thursday. Skipping."
+          exit 0
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Run daily screener
+        env:
+          POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+        run: bash ./run_daily.sh
+
+      - name: Send email summary
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: python send_daily_email.py
+
+      - name: Commit updated results
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add results.xlsx nyse_tickers.csv
+          git commit -m "Update daily screener results" || echo "No changes to commit"
+          git push
