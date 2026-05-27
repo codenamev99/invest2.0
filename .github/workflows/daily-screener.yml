@@ -1,0 +1,81 @@
+name: Daily Screener
+
+on:
+  schedule:
+    # GitHub cron uses UTC. These two hours cover 7:00am ET in EST and EDT;
+    # the first step below exits unless the current New York time is exactly 7.
+    - cron: "0 11,12 * * 0-4"
+  workflow_dispatch:
+
+jobs:
+  run-screener:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check New York run window
+        id: et_time
+        run: |
+          hour=$(TZ=America/New_York date +%H)
+          dow=$(TZ=America/New_York date +%u)
+          should_run=false
+          if { [ "$dow" = "7" ] || [ "$dow" -le 4 ]; } && [ "$hour" = "07" ]; then
+            should_run=true
+          fi
+          echo "hour=$hour" >> "$GITHUB_OUTPUT"
+          echo "dow=$dow" >> "$GITHUB_OUTPUT"
+          echo "should_run=$should_run" >> "$GITHUB_OUTPUT"
+
+      - name: Skip outside 7am ET Sunday-Thursday
+        if: ${{ steps.et_time.outputs.should_run != 'true' }}
+        run: |
+          echo "Not 7:00am ET Sunday-Thursday. Skipping."
+          exit 0
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Run daily screener
+        env:
+          POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+          POLYGON_BOOTSTRAP_YEARS: ${{ vars.POLYGON_BOOTSTRAP_YEARS || '2' }}
+          POLYGON_BACKFILL_DAYS: ${{ vars.POLYGON_BACKFILL_DAYS || '30' }}
+        run: bash ./run_daily.sh
+
+      - name: Email daily summary
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          EMAIL_SUBJECT_PREFIX: ${{ vars.EMAIL_SUBJECT_PREFIX || 'Daily Screener' }}
+          EMAIL_ATTACH_RESULTS: ${{ vars.EMAIL_ATTACH_RESULTS || 'true' }}
+        run: python send_daily_email.py
+
+      - name: Upload results artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: screener-results
+          path: results.xlsx
+          if-no-files-found: error
+
+      - name: Commit updated outputs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add results.xlsx nyse_tickers.csv
+          git commit -m "Update daily screener results" || echo "No workbook changes to commit."
+          git push
