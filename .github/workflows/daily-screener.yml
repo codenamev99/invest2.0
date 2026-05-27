@@ -1,5 +1,8 @@
 name: Daily Screener
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 on:
   schedule:
     # GitHub cron uses UTC. These two hours cover 7:00am ET in EST and EDT;
