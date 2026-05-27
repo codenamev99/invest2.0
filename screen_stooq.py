@@ -1095,6 +1095,32 @@ def _coerce_float(value: Any) -> float | None:
     return out if np.isfinite(out) else None
 
 
+def _top10_first_threshold_hit(
+    open_val: float | None,
+    high_val: float | None,
+    low_val: float | None,
+    rank_close: float | None,
+) -> str:
+    if open_val is None or high_val is None or low_val is None or rank_close is None:
+        return ""
+    target = rank_close * 1.02
+    stop = rank_close * 0.99
+    if open_val >= target:
+        return "+2% first"
+    if open_val <= stop:
+        return "-1% first"
+
+    hit_target = high_val >= target
+    hit_stop = low_val <= stop
+    if hit_target and hit_stop:
+        return "Both - order unknown"
+    if hit_target:
+        return "+2% first"
+    if hit_stop:
+        return "-1% first"
+    return "Neither"
+
+
 def collect_top_ranked_cohorts(wb: Workbook, top_n: int = 10) -> list[dict[str, Any]]:
     """
     Read workbook run sheets and return ranked ticker cohorts for OHLC tracking.
@@ -1170,26 +1196,6 @@ def build_top10_ohlc_tracking_rows(
             return None
         return float(f"{pct_change(value, rank_close):.2f}")
 
-    def first_threshold_hit(open_val: float, high_val: float, low_val: float, rank_close: float | None) -> str:
-        if rank_close is None:
-            return ""
-        target = rank_close * 1.02
-        stop = rank_close * 0.99
-        if open_val >= target:
-            return "+2% first"
-        if open_val <= stop:
-            return "-1% first"
-
-        hit_target = high_val >= target
-        hit_stop = low_val <= stop
-        if hit_target and hit_stop:
-            return "Both - order unknown"
-        if hit_target:
-            return "+2% first"
-        if hit_stop:
-            return "-1% first"
-        return "Neither"
-
     for cohort in cohorts:
         symbol = str(cohort["symbol"]).strip().upper()
         normalized = normalize_symbol(symbol)
@@ -1237,7 +1243,7 @@ def build_top10_ohlc_tracking_rows(
                     pct_vs_rank(close_val, rank_close),
                     hit_target,
                     hit_stop,
-                    first_threshold_hit(open_val, high_val, low_val, rank_close),
+                    _top10_first_threshold_hit(open_val, high_val, low_val, rank_close),
                 ]
             )
 
@@ -1307,10 +1313,22 @@ def write_top10_ohlc_tracking_sheet(
 
     tracking_day_high_col = headers.index("Tracking Day High") + 1
     high_col = headers.index("High") + 1
+    first_hit_col = headers.index("First Hit") + 1
+    open_col = headers.index("Open") + 1
+    low_col = headers.index("Low") + 1
+    rank_close_col = headers.index("Rank Close") + 1
     for row_idx in range(2, ws.max_row + 1):
         tracking_day_high_cell = ws.cell(row=row_idx, column=tracking_day_high_col)
         if tracking_day_high_cell.value in (None, ""):
             tracking_day_high_cell.value = ws.cell(row=row_idx, column=high_col).value
+        first_hit_cell = ws.cell(row=row_idx, column=first_hit_col)
+        if first_hit_cell.value in (None, ""):
+            first_hit_cell.value = _top10_first_threshold_hit(
+                _coerce_float(ws.cell(row=row_idx, column=open_col).value),
+                _coerce_float(ws.cell(row=row_idx, column=high_col).value),
+                _coerce_float(ws.cell(row=row_idx, column=low_col).value),
+                _coerce_float(ws.cell(row=row_idx, column=rank_close_col).value),
+            )
 
     header_fill = PatternFill(fill_type="solid", fgColor=Color(indexed=8))
     header_font = Font(name="Calibri", size=11, bold=True, color=Color(indexed=9))
@@ -1332,7 +1350,7 @@ def write_top10_ohlc_tracking_sheet(
     success_label_cell.alignment = header_align
 
     success_rate_cell = ws["T1"]
-    success_rate_cell.value = '=IFERROR(COUNTIFS($D:$D,1,$O:$O,"Yes")/COUNTIFS($D:$D,1,$O:$O,"<>"),"")'
+    success_rate_cell.value = '=IFERROR(COUNTIFS($D:$D,1,$Q:$Q,"+2% first")/COUNTIFS($D:$D,1,$Q:$Q,"<>"),"")'
     success_rate_cell.fill = header_fill
     success_rate_cell.font = header_font
     success_rate_cell.alignment = header_align
@@ -1348,10 +1366,13 @@ def write_top10_ohlc_tracking_sheet(
     overall_success_rate_cell = ws["V1"]
     overall_success_rate_cell.value = (
         f'=IFERROR(LET(keys,$A$2:$A${data_last_row}&"|"&$B$2:$B${data_last_row}&"|"&$C$2:$C${data_last_row},'
-        f'valid,$O$2:$O${data_last_row}<>"",'
+        f'firstHits,$Q$2:$Q${data_last_row},'
+        f'days,$D$2:$D${data_last_row},'
+        f'valid,firstHits<>"",'
         f'uniqueKeys,UNIQUE(FILTER(keys,valid)),'
-        f'hits,IFERROR(UNIQUE(FILTER(keys,$O$2:$O${data_last_row}="Yes")),""),'
-        f'SUM(--ISNUMBER(XMATCH(uniqueKeys,hits)))/ROWS(uniqueKeys)),"")'
+        f'outcomes,MAP(uniqueKeys,LAMBDA(k,LET(hitMask,(keys=k)*(firstHits<>"Neither")*(firstHits<>""),'
+        f'IFERROR(INDEX(SORTBY(FILTER(firstHits,hitMask),FILTER(days,hitMask),1),1),"Neither")))),'
+        f'SUM(--(outcomes="+2% first"))/ROWS(uniqueKeys)),"")'
     )
     overall_success_rate_cell.fill = header_fill
     overall_success_rate_cell.font = header_font
@@ -1366,8 +1387,8 @@ def write_top10_ohlc_tracking_sheet(
     for row_idx in range(2, ws.max_row + 1):
         for col_idx in range(1, len(headers) + 1):
             ws.cell(row=row_idx, column=col_idx).alignment = data_align
-        hit_target = ws.cell(row=row_idx, column=15).value
-        if isinstance(hit_target, str) and hit_target.strip().lower() == "yes":
+        first_hit = ws.cell(row=row_idx, column=17).value
+        if isinstance(first_hit, str) and first_hit.strip().lower() == "+2% first":
             for col_idx in range(1, len(headers) + 1):
                 cell = ws.cell(row=row_idx, column=col_idx)
                 cell.fill = hit_target_fill
@@ -1547,7 +1568,7 @@ def build_investment_simulation_rows(
             if hit_target:
                 return target_price, bar_dt, "+2% target", "Polygon 1-min"
 
-        if len({bar["date"] for bar in bars}) >= min(follow_days, end_idx - start_idx):
+        if len({bar["date"] for bar in bars}) >= follow_days:
             final_bar = bars[-1]
             return float(final_bar["close"]), final_bar["datetime"], "Max 5 trading days", "Polygon 1-min"
 
