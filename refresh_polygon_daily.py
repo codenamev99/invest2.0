@@ -61,6 +61,12 @@ def parse_args() -> argparse.Namespace:
         help="When --date is omitted, try this many prior calendar days until Polygon returns data.",
     )
     ap.add_argument(
+        "--backfill-days",
+        type=int,
+        default=0,
+        help="Fetch and upsert every weekday in the last N calendar days, ending yesterday.",
+    )
+    ap.add_argument(
         "--new-symbols-dir",
         default="",
         help=(
@@ -155,6 +161,16 @@ def candidate_dates(lookback_days: int) -> list[date]:
     # Start at yesterday so a scheduled morning run does not ask for today's incomplete bar.
     start = date.today() - timedelta(days=1)
     return [start - timedelta(days=i) for i in range(max(1, lookback_days))]
+
+
+def backfill_candidate_dates(backfill_days: int) -> list[date]:
+    start = date.today() - timedelta(days=max(1, backfill_days))
+    end = date.today() - timedelta(days=1)
+    return [
+        start + timedelta(days=i)
+        for i in range((end - start).days + 1)
+        if (start + timedelta(days=i)).weekday() < 5
+    ]
 
 
 def fetch_grouped_daily(
@@ -491,36 +507,14 @@ def upsert_daily_row(path: Path, new_row: str, date_int: int, dry_run: bool) -> 
     return action
 
 
-def main() -> None:
-    args = parse_args()
-    root = resolve_path(args.root)
-    new_symbols_dir = resolve_path(args.new_symbols_dir) if args.new_symbols_dir else None
-    api_key = args.api_key.strip()
-    if not api_key:
-        raise SystemExit("Set POLYGON_API_KEY or pass --api-key.")
-    if api_key.lower() in {"your_polygon_key", "your_key_here"}:
-        raise SystemExit("POLYGON_API_KEY is still set to a placeholder. Replace it with your real Polygon API key.")
-
-    if args.bootstrap:
-        bootstrap_history(args, root, api_key)
-        return
-
-    if args.date:
-        trading_date = datetime.strptime(args.date, "%Y-%m-%d").date()
-        bars = fetch_grouped_daily(api_key, trading_date, adjusted=not args.unadjusted, include_otc=args.include_otc)
-        if not bars:
-            raise SystemExit(f"Polygon returned no grouped rows for {trading_date.isoformat()}.")
-    else:
-        trading_date, bars = find_latest_grouped_data(
-            api_key,
-            lookback_days=args.lookback_days,
-            adjusted=not args.unadjusted,
-            include_otc=args.include_otc,
-        )
-
-    symbol_paths = build_file_map(root)
+def upsert_grouped_bars(
+    bars: list[dict[str, Any]],
+    trading_date: date,
+    symbol_paths: dict[str, Path],
+    new_symbols_dir: Path | None,
+    dry_run: bool,
+) -> dict[str, int]:
     date_int = int(trading_date.strftime("%Y%m%d"))
-
     counts = {"added": 0, "updated": 0, "unchanged": 0, "skipped": 0}
     for bar in bars:
         raw_symbol = str(bar.get("T") or "").strip()
@@ -542,8 +536,104 @@ def main() -> None:
             counts["skipped"] += 1
             continue
 
-        action = upsert_daily_row(path, row, date_int, dry_run=args.dry_run)
+        action = upsert_daily_row(path, row, date_int, dry_run=dry_run)
         counts[action] += 1
+
+    return counts
+
+
+def merge_counts(total: dict[str, int], counts: dict[str, int]) -> None:
+    for key, value in counts.items():
+        total[key] = total.get(key, 0) + value
+
+
+def backfill_recent_days(args: argparse.Namespace, root: Path, new_symbols_dir: Path | None, api_key: str) -> None:
+    dates = backfill_candidate_dates(args.backfill_days)
+    if not dates:
+        raise SystemExit("--backfill-days did not produce any weekdays to fetch.")
+
+    symbol_paths = build_file_map(root)
+    total = {"added": 0, "updated": 0, "unchanged": 0, "skipped": 0, "no_data": 0}
+    mode = "DRY RUN: " if args.dry_run else ""
+    print(
+        f"{mode}Backfilling Polygon grouped daily bars from {dates[0].isoformat()} "
+        f"to {dates[-1].isoformat()} ({len(dates)} weekdays)."
+    )
+
+    for idx, trading_date in enumerate(dates, start=1):
+        bars = fetch_grouped_daily_with_retries(
+            api_key,
+            trading_date,
+            adjusted=not args.unadjusted,
+            include_otc=args.include_otc,
+            rate_limit_sleep=args.rate_limit_sleep,
+        )
+        if not bars:
+            total["no_data"] += 1
+            print(f"[{idx}/{len(dates)}] {trading_date.isoformat()}: no data")
+            continue
+        counts = upsert_grouped_bars(
+            bars,
+            trading_date,
+            symbol_paths=symbol_paths,
+            new_symbols_dir=new_symbols_dir,
+            dry_run=args.dry_run,
+        )
+        merge_counts(total, counts)
+        print(
+            f"[{idx}/{len(dates)}] {trading_date.isoformat()}: "
+            f"added={counts['added']}, updated={counts['updated']}, "
+            f"unchanged={counts['unchanged']}, skipped_new_or_invalid={counts['skipped']}"
+        )
+
+    print(
+        f"{mode}Backfill complete -> added={total['added']}, updated={total['updated']}, "
+        f"unchanged={total['unchanged']}, skipped_new_or_invalid={total['skipped']}, "
+        f"days_no_data={total['no_data']}"
+    )
+
+
+def main() -> None:
+    args = parse_args()
+    root = resolve_path(args.root)
+    new_symbols_dir = resolve_path(args.new_symbols_dir) if args.new_symbols_dir else None
+    api_key = args.api_key.strip()
+    if not api_key:
+        raise SystemExit("Set POLYGON_API_KEY or pass --api-key.")
+    if api_key.lower() in {"your_polygon_key", "your_key_here"}:
+        raise SystemExit("POLYGON_API_KEY is still set to a placeholder. Replace it with your real Polygon API key.")
+
+    if args.bootstrap:
+        bootstrap_history(args, root, api_key)
+        return
+
+    if args.backfill_days:
+        if args.backfill_days <= 0:
+            raise SystemExit("--backfill-days must be > 0.")
+        backfill_recent_days(args, root, new_symbols_dir, api_key)
+        return
+
+    if args.date:
+        trading_date = datetime.strptime(args.date, "%Y-%m-%d").date()
+        bars = fetch_grouped_daily(api_key, trading_date, adjusted=not args.unadjusted, include_otc=args.include_otc)
+        if not bars:
+            raise SystemExit(f"Polygon returned no grouped rows for {trading_date.isoformat()}.")
+    else:
+        trading_date, bars = find_latest_grouped_data(
+            api_key,
+            lookback_days=args.lookback_days,
+            adjusted=not args.unadjusted,
+            include_otc=args.include_otc,
+        )
+
+    symbol_paths = build_file_map(root)
+    counts = upsert_grouped_bars(
+        bars,
+        trading_date,
+        symbol_paths=symbol_paths,
+        new_symbols_dir=new_symbols_dir,
+        dry_run=args.dry_run,
+    )
 
     mode = "DRY RUN: " if args.dry_run else ""
     print(

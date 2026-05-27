@@ -34,6 +34,7 @@ set "RESULTS_FILE=%PROJECT_DIR%results.xlsx"
 set "ROOT_DATA=%PROJECT_DIR%data 2\daily\us"
 set "BENCHMARK=SPY.US"
 if "%POLYGON_BOOTSTRAP_YEARS%"=="" set "POLYGON_BOOTSTRAP_YEARS=2"
+if "%POLYGON_BACKFILL_DAYS%"=="" set "POLYGON_BACKFILL_DAYS=30"
 
 rem -------- Daily Steps --------
 if not "%POLYGON_API_KEY%"=="" (
@@ -45,7 +46,7 @@ if not "%POLYGON_API_KEY%"=="" (
             exit /b 1
         )
     )
-    %PYTHON_CMD% refresh_polygon_daily.py --root "%ROOT_DATA%"
+    %PYTHON_CMD% refresh_polygon_daily.py --root "%ROOT_DATA%" --backfill-days "%POLYGON_BACKFILL_DAYS%"
     if errorlevel 1 (
         echo ERROR: refresh_polygon_daily.py failed. Check POLYGON_API_KEY and your data path, then retry.
         exit /b 1

@@ -28,6 +28,8 @@ PowerShell example:
 
 The Polygon updater can bootstrap a missing `data 2` folder from Polygon daily bars, then append or update the latest daily bar on later runs. On the free tier, the first bootstrap is slow because the script sleeps between daily requests to stay within rate limits.
 
+If your Polygon subscription includes intraday aggregates, the screener's `Investment Dashboard` will use Polygon 1-minute regular-market bars to decide whether the +2% target or -1% stop happened first. If `POLYGON_API_KEY` is not set, it falls back to daily OHLC logic.
+
 Optional Polygon variables:
 ```
 set "POLYGON_BOOTSTRAP_YEARS=2"
