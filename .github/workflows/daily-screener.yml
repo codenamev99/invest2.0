@@ -49,6 +49,16 @@ jobs:
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
 
+      - name: Validate Polygon API key
+        env:
+          POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+        run: |
+          if [ -z "$POLYGON_API_KEY" ]; then
+            echo "POLYGON_API_KEY GitHub secret is missing or empty."
+            echo "Add it under Settings > Secrets and variables > Actions > Repository secrets."
+            exit 1
+          fi
+
       - name: Run daily screener
         env:
           POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
@@ -79,6 +89,10 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add results.xlsx nyse_tickers.csv
-          git commit -m "Update daily screener results" || echo "No workbook changes to commit."
-          git push
+          git add results.xlsx
+          if git diff --cached --quiet; then
+            echo "No workbook changes to commit."
+          else
+            git commit -m "Update daily screener results"
+            git push
+          fi
