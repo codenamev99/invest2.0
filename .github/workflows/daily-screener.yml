@@ -5,9 +5,9 @@ env:
 
 on:
   schedule:
-    # GitHub cron uses UTC. These two hours cover 7:00am ET in EST and EDT;
-    # the first step below exits unless the current New York time is exactly 7.
-    - cron: "0 11,12 * * 0-4"
+    # GitHub cron uses UTC. These two hours cover 4:00am ET in EST and EDT;
+    # the first step below exits unless the current New York time is exactly 4.
+    - cron: "0 8,9 * * 0-4"
   workflow_dispatch:
 
 jobs:
@@ -24,17 +24,17 @@ jobs:
           hour=$(TZ=America/New_York date +%H)
           dow=$(TZ=America/New_York date +%u)
           should_run=false
-          if { [ "$dow" = "7" ] || [ "$dow" -le 4 ]; } && [ "$hour" = "07" ]; then
+          if { [ "$dow" = "7" ] || [ "$dow" -le 4 ]; } && [ "$hour" = "04" ]; then
             should_run=true
           fi
           echo "hour=$hour" >> "$GITHUB_OUTPUT"
           echo "dow=$dow" >> "$GITHUB_OUTPUT"
           echo "should_run=$should_run" >> "$GITHUB_OUTPUT"
 
-      - name: Skip outside 7am ET Sunday-Thursday
+      - name: Skip outside 4am ET Sunday-Thursday
         if: ${{ steps.et_time.outputs.should_run != 'true' }}
         run: |
-          echo "Not 7:00am ET Sunday-Thursday. Skipping."
+          echo "Not 4:00am ET Sunday-Thursday. Skipping."
           exit 0
 
       - name: Check out repository
