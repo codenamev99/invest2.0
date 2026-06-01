@@ -52,7 +52,7 @@ else
   echo "Skipping data refresh. Set POLYGON_API_KEY or STOOQ_SRC in run_daily.sh to enable."
 fi
 
-if [ -f "requirements.txt" ]; then
+if [ "${SKIP_PIP_INSTALL:-0}" != "1" ] && [ -f "requirements.txt" ]; then
   $PYTHON_CMD -m pip install -r "requirements.txt"
 fi
 
