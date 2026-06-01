@@ -110,8 +110,6 @@ def ranked_stocks_table(wb) -> tuple[str, str]:
     selected_cols.extend(
         [
             ("Close", 5 if rank_col else 4),
-            ("ATR %", 17 if rank_col else 16),
-            ("Avg $ Vol", 24 if rank_col else 23),
             ("Next Earnings", 27 if rank_col else 26),
         ]
     )
@@ -143,7 +141,7 @@ def upcoming_ipos_table(wb) -> str:
     header_row = None
     for row_idx in range(1, min(ws.max_row, 10) + 1):
         values = [ws.cell(row=row_idx, column=col_idx).value for col_idx in range(1, ws.max_column + 1)]
-        if any(values):
+        if sum(value is not None for value in values) > 1:
             header_row = row_idx
             break
     if header_row is None:
