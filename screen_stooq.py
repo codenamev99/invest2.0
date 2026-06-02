@@ -934,22 +934,10 @@ def last_close_5pct_higher_info(
     return _format_mmddyyyy(dt), int((last_date - dt).days)
 
 
-def unique_sheet_name(wb: Workbook, base: str) -> str:
-    """
-    Return a unique worksheet name (<= 31 chars) for the workbook.
-    """
-    base = base.strip()[:31] or "Results"
-    if base not in wb.sheetnames:
-        return base
-
-    idx = 2
-    while True:
-        suffix = f" ({idx})"
-        trimmed = base[: 31 - len(suffix)]
-        name = f"{trimmed}{suffix}"
-        if name not in wb.sheetnames:
-            return name
-        idx += 1
+def clear_sheet(ws) -> None:
+    for merged_range in list(ws.merged_cells.ranges):
+        ws.unmerge_cells(str(merged_range))
+    ws.delete_rows(1, ws.max_row)
 
 
 def is_empty_sheet(ws) -> bool:
@@ -992,15 +980,32 @@ def append_single_ticker_section(
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
 
+def _parse_run_sheet_date(sheet_name: str) -> date | None:
+    base_name = sheet_name.split(" (", 1)[0].strip()
+    try:
+        return datetime.strptime(base_name, "%d %b %Y").date()
+    except Exception:
+        return None
+
+
 def count_recent_symbol_occurrences(wb: Workbook, max_runs: int = 5) -> dict[str, int]:
     """
-    Count how many of the last N sheets each symbol appeared in.
+    Count how many of the last N unique run dates each symbol appeared in.
     """
     if max_runs <= 0 or not wb.sheetnames:
         return {}
 
-    run_sheet_names = [name for name in wb.sheetnames if name not in PROTECTED_SHEET_NAMES]
-    recent_names = run_sheet_names[-max_runs:]
+    latest_sheet_by_date: dict[date, str] = {}
+    for name in wb.sheetnames:
+        if name in PROTECTED_SHEET_NAMES:
+            continue
+        run_date = _parse_run_sheet_date(name)
+        if run_date is None:
+            continue
+        latest_sheet_by_date[run_date] = name
+
+    recent_dates = sorted(latest_sheet_by_date)[-max_runs:]
+    recent_names = [latest_sheet_by_date[run_date] for run_date in recent_dates]
     counts: dict[str, int] = {}
     for name in recent_names:
         ws = wb[name]
@@ -1017,14 +1022,6 @@ def count_recent_symbol_occurrences(wb: Workbook, max_runs: int = 5) -> dict[str
             counts[sym] = counts.get(sym, 0) + 1
 
     return counts
-
-
-def _parse_run_sheet_date(sheet_name: str) -> date | None:
-    base_name = sheet_name.split(" (", 1)[0].strip()
-    try:
-        return datetime.strptime(base_name, "%d %b %Y").date()
-    except Exception:
-        return None
 
 
 def collect_qualified_result_dates(
@@ -2833,12 +2830,27 @@ def main() -> None:
         else:
             ws = wb.create_sheet(title="Single Tickers")
     else:
-        sheet_name = unique_sheet_name(wb, headline)
+        sheet_name = headline
         if len(wb.sheetnames) == 1 and is_empty_sheet(wb.active):
             ws = wb.active
             ws.title = sheet_name
         else:
-            ws = wb.create_sheet(title=sheet_name)
+            existing_names = [
+                name
+                for name in wb.sheetnames
+                if name not in PROTECTED_SHEET_NAMES and _parse_run_sheet_date(name) == data_date
+            ]
+            sheet_to_reuse = sheet_name if sheet_name in existing_names else (existing_names[-1] if existing_names else "")
+            for name in existing_names:
+                if name != sheet_to_reuse:
+                    del wb[name]
+            if sheet_to_reuse:
+                ws = wb[sheet_to_reuse]
+                clear_sheet(ws)
+                if ws.title != sheet_name:
+                    ws.title = sheet_name
+            else:
+                ws = wb.create_sheet(title=sheet_name)
 
         ws.append(header_row)
 
