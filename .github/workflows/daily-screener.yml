@@ -5,9 +5,9 @@ env:
 
 on:
   schedule:
-    # GitHub cron uses UTC.
-    - cron: "0 6 * * 2-5"
-    - cron: "0 18 * * 0"
+    # 4:30 PM Eastern time, Monday–Friday.
+    - cron: "30 16 * * 1-5"
+      timezone: "America/New_York"
   workflow_dispatch:
 
 jobs:
