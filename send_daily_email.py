@@ -13,12 +13,16 @@ from openpyxl import load_workbook
 
 RESULTS_PATH = Path(os.environ.get("RESULTS_FILE", "results.xlsx"))
 UPCOMING_IPOS_SHEET_NAME = "Upcoming IPOs (60D)"
+UPCOMING_EARNINGS_SHEET_NAME = "Upcoming Earnings (14D)"
+SIMULATION_SHEET_NAME = "Simulation"
+LEGACY_SIMULATION_SHEET_NAME = "Summary"
 PROTECTED_SHEETS = {
     "Single Tickers",
     UPCOMING_IPOS_SHEET_NAME,
-    "Upcoming Earnings (14D)",
+    UPCOMING_EARNINGS_SHEET_NAME,
     "Top 10 OHLC Tracking",
-    "Summary",
+    SIMULATION_SHEET_NAME,
+    LEGACY_SIMULATION_SHEET_NAME,
     "Investment Dashboard",
 }
 
@@ -62,14 +66,22 @@ def format_value(value: Any, number_format: str = "") -> str:
     if isinstance(value, date):
         return value.strftime("%b %-d, %Y")
     if isinstance(value, float):
-        if "0.00%" in number_format or '0.00"%"' in number_format:
+        if '0.00"%"' in number_format:
             return f"{value:.2f}%"
+        if "0.00%" in number_format:
+            return f"{value:.2%}"
         if "0%" in number_format and abs(value) <= 1:
             return f"{value:.0%}"
         if "$" in number_format:
             return f"${value:,.2f}"
         return f"{value:,.2f}"
     if isinstance(value, int):
+        if '0.00"%"' in number_format:
+            return f"{value:.2f}%"
+        if "0.00%" in number_format:
+            return f"{value:.2%}"
+        if "0%" in number_format and abs(value) <= 1:
+            return f"{value:.0%}"
         if "$" in number_format:
             return f"${value:,.2f}"
         return f"{value:,}"
@@ -92,6 +104,41 @@ def html_table(headers: list[str], rows: list[list[str]]) -> str:
       <tbody>{''.join(body_html)}</tbody>
     </table>
     """
+
+
+def worksheet_table(wb, sheet_name: str, max_rows: int | None = None) -> str:
+    if sheet_name not in wb.sheetnames:
+        return f"<p>No {html.escape(sheet_name)} sheet was found.</p>"
+
+    ws = wb[sheet_name]
+    header_row = None
+    for row_idx in range(1, min(ws.max_row, 10) + 1):
+        values = [ws.cell(row=row_idx, column=col_idx).value for col_idx in range(1, ws.max_column + 1)]
+        if sum(value is not None for value in values) > 1:
+            header_row = row_idx
+            break
+    if header_row is None:
+        return f"<p>No rows found in {html.escape(sheet_name)}.</p>"
+
+    headers = [
+        str(ws.cell(row=header_row, column=col_idx).value or "").strip() or f"Column {col_idx}"
+        for col_idx in range(1, ws.max_column + 1)
+    ]
+    rows: list[list[str]] = []
+    for row_idx in range(header_row + 1, ws.max_row + 1):
+        values = [ws.cell(row=row_idx, column=col_idx).value for col_idx in range(1, ws.max_column + 1)]
+        if not any(values):
+            continue
+        rows.append(
+            [
+                format_value(ws.cell(row=row_idx, column=col_idx).value, ws.cell(row=row_idx, column=col_idx).number_format)
+                for col_idx in range(1, ws.max_column + 1)
+            ]
+        )
+        if max_rows is not None and len(rows) >= max_rows:
+            break
+
+    return html_table(headers, rows)
 
 
 def ranked_stocks_table(wb) -> tuple[str, str]:
@@ -134,38 +181,55 @@ def ranked_stocks_table(wb) -> tuple[str, str]:
 
 
 def upcoming_ipos_table(wb) -> str:
-    if UPCOMING_IPOS_SHEET_NAME not in wb.sheetnames:
-        return "<p>No upcoming IPO sheet was found.</p>"
+    return worksheet_table(wb, UPCOMING_IPOS_SHEET_NAME, max_rows=20)
 
-    ws = wb[UPCOMING_IPOS_SHEET_NAME]
-    header_row = None
-    for row_idx in range(1, min(ws.max_row, 10) + 1):
-        values = [ws.cell(row=row_idx, column=col_idx).value for col_idx in range(1, ws.max_column + 1)]
-        if sum(value is not None for value in values) > 1:
-            header_row = row_idx
+
+def upcoming_earnings_table(wb) -> str:
+    return worksheet_table(wb, UPCOMING_EARNINGS_SHEET_NAME)
+
+
+def simulation_totals_html(wb) -> str:
+    sheet_name = next(
+        (name for name in (SIMULATION_SHEET_NAME, LEGACY_SIMULATION_SHEET_NAME) if name in wb.sheetnames),
+        None,
+    )
+    if sheet_name is None:
+        return "<p>Simulated Portfolio totals: Simulation sheet not found.</p>"
+
+    ws = wb[sheet_name]
+    total_label_row = None
+    for row_idx in range(1, ws.max_row + 1):
+        labels = {
+            str(ws.cell(row=row_idx, column=7).value or "").strip().upper(),
+            str(ws.cell(row=row_idx, column=8).value or "").strip().upper(),
+        }
+        if "TOTAL" in labels:
+            total_label_row = row_idx
             break
-    if header_row is None:
-        return "<p>No upcoming IPO rows found.</p>"
 
-    headers = [
-        str(ws.cell(row=header_row, column=col_idx).value or "").strip() or f"Column {col_idx}"
-        for col_idx in range(1, ws.max_column + 1)
-    ]
-    rows: list[list[str]] = []
-    for row_idx in range(header_row + 1, ws.max_row + 1):
-        values = [ws.cell(row=row_idx, column=col_idx).value for col_idx in range(1, ws.max_column + 1)]
-        if not any(values):
-            continue
-        rows.append(
-            [
-                format_value(ws.cell(row=row_idx, column=col_idx).value, ws.cell(row=row_idx, column=col_idx).number_format)
-                for col_idx in range(1, ws.max_column + 1)
-            ]
+    if total_label_row is None:
+        return "<p>Simulated Portfolio totals: TOTAL row not found.</p>"
+
+    total_formula_row = total_label_row + 1
+    dollar_value = ws.cell(row=total_formula_row, column=7).value
+    percent_value = ws.cell(row=total_formula_row, column=8).value
+
+    if not isinstance(dollar_value, (int, float)):
+        dollar_value = sum(
+            float(ws.cell(row=row_idx, column=7).value or 0)
+            for row_idx in range(2, total_label_row)
+            if isinstance(ws.cell(row=row_idx, column=7).value, (int, float))
         )
-        if len(rows) >= 20:
-            break
+    if not isinstance(percent_value, (int, float)):
+        percent_value = sum(
+            float(ws.cell(row=row_idx, column=8).value or 0)
+            for row_idx in range(2, total_label_row)
+            if isinstance(ws.cell(row=row_idx, column=8).value, (int, float))
+        )
 
-    return html_table(headers, rows)
+    dollar_total = format_value(dollar_value, '"$"#,##0.00')
+    percent_total = format_value(percent_value, "0.00%")
+    return f"<p><strong>Simulated Portfolio totals:</strong> {html.escape(dollar_total)} and {html.escape(percent_total)}.</p>"
 
 
 def build_email_html() -> tuple[str, str]:
@@ -174,7 +238,9 @@ def build_email_html() -> tuple[str, str]:
 
     wb = load_workbook(RESULTS_PATH, data_only=True)
     ranked_title, ranked_html = ranked_stocks_table(wb)
+    simulation_totals = simulation_totals_html(wb)
     ipo_html = upcoming_ipos_table(wb)
+    earnings_html = upcoming_earnings_table(wb)
     run_date = datetime.now().strftime("%b %-d, %Y")
     subject_prefix = os.environ.get("EMAIL_SUBJECT_PREFIX", "Daily Screener").strip() or "Daily Screener"
     subject = f"{subject_prefix} - {run_date}"
@@ -192,10 +258,13 @@ def build_email_html() -> tuple[str, str]:
       </head>
       <body>
         <p>Attached is the latest <code>results.xlsx</code> workbook.</p>
+        {simulation_totals}
         <h2>{ranked_title}</h2>
         {ranked_html}
         <h2>Upcoming IPOs</h2>
         {ipo_html}
+        <h2>Upcoming Earnings</h2>
+        {earnings_html}
       </body>
     </html>
     """
