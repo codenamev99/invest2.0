@@ -3,7 +3,7 @@ from __future__ import annotations
 import html
 import os
 import smtplib
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
@@ -184,8 +184,63 @@ def upcoming_ipos_table(wb) -> str:
     return worksheet_table(wb, UPCOMING_IPOS_SHEET_NAME, max_rows=20)
 
 
+def parse_cell_date(value: Any) -> date | None:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        value = value.strip()
+        for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%b %d, %Y", "%B %d, %Y"):
+            try:
+                return datetime.strptime(value, fmt).date()
+            except ValueError:
+                continue
+    return None
+
+
 def upcoming_earnings_table(wb) -> str:
-    return worksheet_table(wb, UPCOMING_EARNINGS_SHEET_NAME)
+    if UPCOMING_EARNINGS_SHEET_NAME not in wb.sheetnames:
+        return f"<p>No {html.escape(UPCOMING_EARNINGS_SHEET_NAME)} sheet was found.</p>"
+
+    ws = wb[UPCOMING_EARNINGS_SHEET_NAME]
+    header_row = None
+    for row_idx in range(1, min(ws.max_row, 10) + 1):
+        headers = [
+            str(ws.cell(row=row_idx, column=col_idx).value or "").strip()
+            for col_idx in range(1, ws.max_column + 1)
+        ]
+        normalized = {header.lower(): col_idx for col_idx, header in enumerate(headers, start=1)}
+        if {"symbol", "company", "earnings date"}.issubset(normalized):
+            header_row = row_idx
+            symbol_col = normalized["symbol"]
+            company_col = normalized["company"]
+            date_col = normalized["earnings date"]
+            break
+    else:
+        return f"<p>No earnings table was found in {html.escape(UPCOMING_EARNINGS_SHEET_NAME)}.</p>"
+
+    today = date.today()
+    end_date = today + timedelta(days=7)
+    rows: list[list[str]] = []
+    for row_idx in range(header_row + 1, ws.max_row + 1):
+        earnings_date = parse_cell_date(ws.cell(row=row_idx, column=date_col).value)
+        if earnings_date is None or earnings_date < today or earnings_date > end_date:
+            continue
+
+        company = format_value(
+            ws.cell(row=row_idx, column=company_col).value,
+            ws.cell(row=row_idx, column=company_col).number_format,
+        )
+        symbol = format_value(
+            ws.cell(row=row_idx, column=symbol_col).value,
+            ws.cell(row=row_idx, column=symbol_col).number_format,
+        )
+        rows.append([format_value(earnings_date), company, symbol])
+
+    rows.sort(key=lambda row: (parse_cell_date(row[0]) or end_date, row[2]))
+    return html_table(["Date", "Company", "Symbol"], rows)
+
 
 
 def simulation_totals_html(wb) -> str:
