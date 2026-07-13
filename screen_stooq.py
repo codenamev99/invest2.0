@@ -999,9 +999,15 @@ def _parse_run_sheet_date(sheet_name: str) -> date | None:
         return None
 
 
-def count_recent_symbol_occurrences(wb: Workbook, max_runs: int = 5) -> dict[str, int]:
+def count_recent_symbol_occurrences(
+    wb: Workbook,
+    max_runs: int = 5,
+    before_date: date | None = None,
+) -> dict[str, int]:
     """
     Count how many of the last N unique run dates each symbol appeared in.
+    When before_date is provided, exclude sheets from that date or later so
+    repeated same-day runs do not count the current run as prior history.
     """
     if max_runs <= 0 or not wb.sheetnames:
         return {}
@@ -1012,6 +1018,8 @@ def count_recent_symbol_occurrences(wb: Workbook, max_runs: int = 5) -> dict[str
             continue
         run_date = _parse_run_sheet_date(name)
         if run_date is None:
+            continue
+        if before_date is not None and run_date >= before_date:
             continue
         latest_sheet_by_date[run_date] = name
 
@@ -3105,7 +3113,7 @@ def main() -> None:
 
     if out_path.exists():
         wb = load_workbook(out_path)
-        prev_counts = count_recent_symbol_occurrences(wb, max_runs=5) if run_mode == "all" else {}
+        prev_counts = count_recent_symbol_occurrences(wb, max_runs=5, before_date=data_date) if run_mode == "all" else {}
     else:
         wb = Workbook()
         prev_counts = {}
