@@ -466,6 +466,7 @@ UPCOMING_EARNINGS_SHEET_NAME = "Upcoming Earnings (14D)"
 TOP10_OHLC_SHEET_NAME = "Top 10 OHLC Tracking"
 INVESTMENT_DASHBOARD_SHEET_NAME = "Investment Dashboard"
 SUMMARY_SHEET_NAME = "Simulation"
+AM_SIMULATION_SHEET_NAME = "AM Simulation"
 LEGACY_SUMMARY_SHEET_NAME = "Summary"
 TOP10_OHLC_HIDDEN_COLUMNS = ("F", "G", "H", "M", "P")
 TOP10_OHLC_TRAILING_HIDDEN_COLUMNS = ("R",)
@@ -476,6 +477,7 @@ PROTECTED_SHEET_NAMES = {
     TOP10_OHLC_SHEET_NAME,
     INVESTMENT_DASHBOARD_SHEET_NAME,
     SUMMARY_SHEET_NAME,
+    AM_SIMULATION_SHEET_NAME,
     LEGACY_SUMMARY_SHEET_NAME,
 }
 
@@ -1632,16 +1634,22 @@ def build_investment_simulation_rows(
     polygon_api_key: str = "",
     intraday_exit_source: str = "auto",
     market_regimes: dict[date, dict[str, Any]] | None = None,
+    entry_session: str = "regular",
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     ohlc_cache: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
-    intraday_cache: dict[tuple[str, date, date], list[dict[str, Any]]] = {}
+    intraday_cache: dict[tuple[str, date, date, str], list[dict[str, Any]]] = {}
 
     def polygon_ticker(symbol: str) -> str:
         return normalize_symbol(symbol).removesuffix(".US")
 
-    def fetch_polygon_minute_bars(symbol: str, start_date: date, end_date: date) -> list[dict[str, Any]]:
-        key = (normalize_symbol(symbol), start_date, end_date)
+    def fetch_polygon_minute_bars(
+        symbol: str,
+        start_date: date,
+        end_date: date,
+        session: str = "regular",
+    ) -> list[dict[str, Any]]:
+        key = (normalize_symbol(symbol), start_date, end_date, session)
         if key in intraday_cache:
             return intraday_cache[key]
 
@@ -1681,11 +1689,15 @@ def build_investment_simulation_rows(
                 ts_et = datetime.fromtimestamp(float(ts) / 1000.0, tz=EASTERN_TZ)
                 if ts_et.weekday() >= 5:
                     continue
-                # Keep regular-session minute bars only. The timestamp is the minute's start.
-                if not (
-                    (ts_et.hour > 9 or (ts_et.hour == 9 and ts_et.minute >= 30))
-                    and (ts_et.hour < 16)
-                ):
+                # Polygon timestamps identify the start of each minute. AM extended
+                # hours are 4:00-9:29 a.m. ET; regular hours are 9:30 a.m.-4:00 p.m. ET.
+                minute_of_day = ts_et.hour * 60 + ts_et.minute
+                in_requested_session = (
+                    4 * 60 <= minute_of_day < 9 * 60 + 30
+                    if session == "am"
+                    else 9 * 60 + 30 <= minute_of_day < 16 * 60
+                )
+                if not in_requested_session:
                     continue
                 try:
                     bars.append(
@@ -1774,12 +1786,25 @@ def build_investment_simulation_rows(
 
         entry_date = date_from_int(int(dates[start_idx]))
         entry_price = float(opens[start_idx])
+        entry_time = "Market Open"
         data_source = "Daily OHLC"
-        if entry_allowed and intraday_exit_source != "daily" and polygon_api_key:
+        if entry_session == "am":
+            # Daily OHLC has no extended-hours price, so an AM entry requires Polygon.
+            if not polygon_api_key:
+                continue
+            minute_bars = fetch_polygon_minute_bars(symbol, entry_date, entry_date, session="am")
+            first_am_bar = next((bar for bar in minute_bars if bar["date"] == entry_date), None)
+            if first_am_bar is None:
+                continue
+            entry_price = float(first_am_bar["open"])
+            entry_time = first_am_bar["datetime"].strftime("%I:%M %p ET")
+            data_source = "Polygon 1-min AM extended hours"
+        elif entry_allowed and intraday_exit_source != "daily" and polygon_api_key:
             minute_bars = fetch_polygon_minute_bars(symbol, entry_date, entry_date)
             first_regular_bar = next((bar for bar in minute_bars if bar["date"] == entry_date), None)
             if first_regular_bar is not None:
                 entry_price = float(first_regular_bar["open"])
+                entry_time = first_regular_bar["datetime"].strftime("%I:%M %p ET")
                 data_source = "Polygon 1-min"
         if entry_price <= 0:
             continue
@@ -1856,7 +1881,7 @@ def build_investment_simulation_rows(
                 "rank": int(cohort["rank"]),
                 "symbol": symbol,
                 "entry_date": entry_date,
-                "entry_time": "Market Open",
+                "entry_time": entry_time,
                 "entry_price": entry_price,
                 "shares": shares,
                 "investment": investment_amount,
@@ -2211,15 +2236,37 @@ def write_summary_only_sheet(
     )
     write_summary_sheet(wb, [row for row in simulation_rows if row["status"] != "Blocked"])
 
+    am_simulation_rows = build_investment_simulation_rows(
+        cohorts,
+        symbol_paths,
+        root,
+        position_size=position_size,
+        polygon_api_key=polygon_api_key,
+        intraday_exit_source=intraday_exit_source,
+        market_regimes=market_regimes,
+        entry_session="am",
+    )
+    write_summary_sheet(
+        wb,
+        [row for row in am_simulation_rows if row["status"] != "Blocked"],
+        sheet_name=AM_SIMULATION_SHEET_NAME,
+        include_entry_time=True,
+    )
 
-def write_summary_sheet(wb: Workbook, simulation_rows: list[dict[str, Any]]) -> None:
+
+def write_summary_sheet(
+    wb: Workbook,
+    simulation_rows: list[dict[str, Any]],
+    sheet_name: str = SUMMARY_SHEET_NAME,
+    include_entry_time: bool = False,
+) -> None:
     if LEGACY_SUMMARY_SHEET_NAME in wb.sheetnames and SUMMARY_SHEET_NAME not in wb.sheetnames:
         wb[LEGACY_SUMMARY_SHEET_NAME].title = SUMMARY_SHEET_NAME
     elif LEGACY_SUMMARY_SHEET_NAME in wb.sheetnames:
         wb.remove(wb[LEGACY_SUMMARY_SHEET_NAME])
 
-    if SUMMARY_SHEET_NAME in wb.sheetnames:
-        ws = wb[SUMMARY_SHEET_NAME]
+    if sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
         for merged_range in list(ws.merged_cells.ranges):
             ws.unmerge_cells(str(merged_range))
         ws.delete_rows(1, ws.max_row)
@@ -2229,13 +2276,19 @@ def write_summary_sheet(wb: Workbook, simulation_rows: list[dict[str, Any]]) -> 
             if INVESTMENT_DASHBOARD_SHEET_NAME in wb.sheetnames
             else len(wb.sheetnames)
         )
-        ws = wb.create_sheet(title=SUMMARY_SHEET_NAME, index=insert_at)
+        if sheet_name == AM_SIMULATION_SHEET_NAME and SUMMARY_SHEET_NAME in wb.sheetnames:
+            insert_at = wb.sheetnames.index(SUMMARY_SHEET_NAME) + 1
+        ws = wb.create_sheet(title=sheet_name, index=insert_at)
 
     headers = [
         "Symbol",
         "Rank \nDate",
         "Entry \nDate",
         "Entry\nPrice",
+    ]
+    if include_entry_time:
+        headers.append("Entry\nTime")
+    headers += [
         "Exit\nDate",
         "Exit\nPrice",
         "Result\n$",
@@ -2254,19 +2307,22 @@ def write_summary_sheet(wb: Workbook, simulation_rows: list[dict[str, Any]]) -> 
             exit_date = None
         status = str(row.get("status", "")).strip()
         is_closed = status == "Closed" or (not status and exit_date is not None)
-        summary_rows.append(
-            [
-                row.get("symbol"),
-                row.get("rank_date"),
-                entry_date,
-                row.get("entry_price"),
-                exit_date,
-                row.get("exit_price") if exit_date else None,
-                row.get("result_currency") if exit_date else None,
-                row.get("result_pct") if exit_date else None,
-                _trading_days_open(entry_date, exit_date) if is_closed else None,
-            ]
-        )
+        output_row = [
+            row.get("symbol"),
+            row.get("rank_date"),
+            entry_date,
+            row.get("entry_price"),
+        ]
+        if include_entry_time:
+            output_row.append(row.get("entry_time"))
+        output_row += [
+            exit_date,
+            row.get("exit_price") if exit_date else None,
+            row.get("result_currency") if exit_date else None,
+            row.get("result_pct") if exit_date else None,
+            _trading_days_open(entry_date, exit_date) if is_closed else None,
+        ]
+        summary_rows.append(output_row)
 
     for output_row in summary_rows:
         ws.append(output_row)
@@ -2275,14 +2331,28 @@ def write_summary_sheet(wb: Workbook, simulation_rows: list[dict[str, Any]]) -> 
     data_end_row = data_start_row + len(summary_rows) - 1
     total_label_row = data_end_row + 3 if summary_rows else 4
     total_formula_row = total_label_row + 1
-    ws.cell(row=total_label_row, column=7, value="TOTAL")
-    ws.cell(row=total_label_row, column=8, value="TOTAL")
+    shift = 1 if include_entry_time else 0
+    result_currency_col = 7 + shift
+    result_pct_col = 8 + shift
+    last_col = 9 + shift
+    ws.cell(row=total_label_row, column=result_currency_col, value="TOTAL")
+    ws.cell(row=total_label_row, column=result_pct_col, value="TOTAL")
     if summary_rows:
-        ws.cell(row=total_formula_row, column=7, value=f"=SUM(G{data_start_row}:G{data_end_row})")
-        ws.cell(row=total_formula_row, column=8, value=f"=SUM(H{data_start_row}:H{data_end_row})")
+        result_currency_letter = get_column_letter(result_currency_col)
+        result_pct_letter = get_column_letter(result_pct_col)
+        ws.cell(
+            row=total_formula_row,
+            column=result_currency_col,
+            value=f"=SUM({result_currency_letter}{data_start_row}:{result_currency_letter}{data_end_row})",
+        )
+        ws.cell(
+            row=total_formula_row,
+            column=result_pct_col,
+            value=f"=SUM({result_pct_letter}{data_start_row}:{result_pct_letter}{data_end_row})",
+        )
     else:
-        ws.cell(row=total_formula_row, column=7, value=0)
-        ws.cell(row=total_formula_row, column=8, value=0)
+        ws.cell(row=total_formula_row, column=result_currency_col, value=0)
+        ws.cell(row=total_formula_row, column=result_pct_col, value=0)
 
     black = Color(indexed=8)
     white = Color(indexed=9)
@@ -2314,6 +2384,7 @@ def write_summary_sheet(wb: Workbook, simulation_rows: list[dict[str, Any]]) -> 
         "G": 11.5391,
         "H": 13.0,
         "I": 13.0,
+        "J": 13.0,
     }
     for col_letter, width in column_widths.items():
         ws.column_dimensions[col_letter].width = width
@@ -2331,30 +2402,32 @@ def write_summary_sheet(wb: Workbook, simulation_rows: list[dict[str, Any]]) -> 
         right = thin_black
         if col_idx == 1:
             left = thin_light_gray
-        if col_idx == 9:
+        if col_idx == last_col:
             right = thin_light_gray
-        if col_idx in {3, 5, 7, 9}:
+        thick_left_cols = {3, 5 + shift, 7 + shift, 9 + shift}
+        thick_right_cols = {2, 4, 6 + shift, 8 + shift}
+        if col_idx in thick_left_cols:
             left = thick_black
-        if col_idx in {2, 4, 6, 8}:
+        if col_idx in thick_right_cols:
             right = thick_black
         top = thin_black if include_top else None
         bottom = thin_black if include_bottom else None
-        if row_idx == total_formula_row and col_idx in {7, 8}:
+        if row_idx == total_formula_row and col_idx in {result_currency_col, result_pct_col}:
             bottom = thick_black
         return Border(left=left, right=right, top=top, bottom=bottom)
 
-    for col_idx in range(1, 10):
+    for col_idx in range(1, last_col + 1):
         cell = ws.cell(row=1, column=col_idx)
-        cell.fill = light_gray_fill if col_idx in {7, 8} else black_fill
-        cell.font = result_header_font if col_idx in {7, 8} else header_font
+        cell.fill = light_gray_fill if col_idx in {result_currency_col, result_pct_col} else black_fill
+        cell.font = result_header_font if col_idx in {result_currency_col, result_pct_col} else header_font
         cell.alignment = header_align
         cell.number_format = "@"
         cell.border = summary_border(col_idx, 1, include_top=False, include_bottom=False)
 
     for row_idx in range(2, total_formula_row + 1):
-        for col_idx in range(1, 10):
+        for col_idx in range(1, last_col + 1):
             cell = ws.cell(row=row_idx, column=col_idx)
-            cell.fill = light_gray_fill if col_idx in {7, 8} else white_fill
+            cell.fill = light_gray_fill if col_idx in {result_currency_col, result_pct_col} else white_fill
             cell.alignment = center
             cell.font = regular_font
             include_top = row_idx > 2 and row_idx <= max(data_end_row, 1)
@@ -2362,14 +2435,14 @@ def write_summary_sheet(wb: Workbook, simulation_rows: list[dict[str, Any]]) -> 
             if col_idx == 1:
                 cell.font = symbol_font
                 cell.number_format = "@"
-            elif col_idx in {2, 3, 5}:
+            elif col_idx in {2, 3, 5 + shift}:
                 cell.number_format = date_format
-            elif col_idx in {4, 6}:
+            elif col_idx in {4, 6 + shift}:
                 cell.number_format = currency_format
-            elif col_idx == 7:
+            elif col_idx == result_currency_col:
                 cell.font = total_font if row_idx == total_label_row else result_font
                 cell.number_format = "@" if row_idx == total_label_row else result_currency_format
-            elif col_idx == 8:
+            elif col_idx == result_pct_col:
                 cell.font = total_font if row_idx == total_label_row else result_font
                 cell.number_format = "@" if row_idx == total_label_row else result_pct_format
             else:
