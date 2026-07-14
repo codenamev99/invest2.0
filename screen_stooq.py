@@ -473,6 +473,7 @@ TOP10_OHLC_SHEET_NAME = "Top 10 OHLC Tracking"
 INVESTMENT_DASHBOARD_SHEET_NAME = "Investment Dashboard"
 SUMMARY_SHEET_NAME = "Simulation"
 AM_SIMULATION_SHEET_NAME = "AM Simulation"
+SIMULATION_START_DATE = date(2026, 6, 12)
 LEGACY_SUMMARY_SHEET_NAME = "Summary"
 TOP10_OHLC_HIDDEN_COLUMNS = ("F", "G", "H", "M", "P")
 TOP10_OHLC_TRAILING_HIDDEN_COLUMNS = ("R",)
@@ -1169,6 +1170,8 @@ def collect_top_ranked_cohorts(wb: Workbook, top_n: int = 10) -> list[dict[str, 
         rank_date = _parse_run_sheet_date(name)
         if rank_date is None:
             continue
+        if rank_date < SIMULATION_START_DATE:
+            continue
         # If a workbook has duplicate run sheets for the same date, use the last
         # one in workbook order and avoid double-counting its top ranked tickers.
         run_sheets_by_date[rank_date] = name
@@ -1505,8 +1508,9 @@ def evaluate_market_regime(
     mode: str = MARKET_REGIME_DEFAULT_MODE,
 ) -> dict[str, Any]:
     """
-    Market gate for new entries. The standard mode matches the original
-    SPY/QQQ 50DMA + SPY 5D>-2% filter; aggressive adds trend and momentum checks.
+    SPY-only market gate for new entries. Standard mode requires SPY above
+    its 50DMA with 5D return > -2%; aggressive adds long-term trend checks
+    and requires positive 5D momentum.
     """
     mode = mode if mode in MARKET_REGIME_MODES else MARKET_REGIME_DEFAULT_MODE
     fast_sma_days = MARKET_REGIME_FAST_SMA_DAYS
@@ -1514,7 +1518,6 @@ def evaluate_market_regime(
     long_sma_days = MARKET_REGIME_LONG_SMA_DAYS
     momentum_days = MARKET_REGIME_MOMENTUM_DAYS
     min_spy_return_5d = 0.0 if mode == "aggressive" else MARKET_REGIME_SPY_MIN_5D_RETURN
-    min_qqq_return_5d = 0.0
     metrics: dict[str, Any] = {
         "regime": "Unknown",
         "market_regime_mode": mode,
@@ -1534,26 +1537,17 @@ def evaluate_market_regime(
     rank_date_int = date_to_int(rank_date)
     spy_series = _market_symbol_series(MARKET_REGIME_SPY, symbol_paths, root, cache)
     qqq_series = _market_symbol_series(MARKET_REGIME_QQQ, symbol_paths, root, cache)
-    if spy_series is None or qqq_series is None:
-        missing = []
-        if spy_series is None:
-            missing.append(MARKET_REGIME_SPY)
-        if qqq_series is None:
-            missing.append(MARKET_REGIME_QQQ)
-        metrics["reason"] = f"Missing market data for {', '.join(missing)}; entry not blocked."
+    if spy_series is None:
+        metrics["reason"] = f"Missing market data for {MARKET_REGIME_SPY}; entry not blocked."
         return metrics
 
     spy_dates, _spy_opens, _spy_highs, _spy_lows, spy_closes = spy_series
-    qqq_dates, _qqq_opens, _qqq_highs, _qqq_lows, qqq_closes = qqq_series
     spy_idx = int(np.searchsorted(spy_dates, rank_date_int, side="right") - 1)
-    qqq_idx = int(np.searchsorted(qqq_dates, rank_date_int, side="right") - 1)
     required_spy_idx = max(sma_days - 1, momentum_days)
-    required_qqq_idx = sma_days - 1
     if mode == "aggressive":
         required_spy_idx = max(required_spy_idx, long_sma_days - 1)
-        required_qqq_idx = max(required_qqq_idx, momentum_days)
-    if spy_idx < required_spy_idx or qqq_idx < required_qqq_idx:
-        metrics["reason"] = "Insufficient SPY/QQQ history; entry not blocked."
+    if spy_idx < required_spy_idx:
+        metrics["reason"] = "Insufficient SPY history; entry not blocked."
         return metrics
 
     spy_close = float(spy_closes[spy_idx])
@@ -1564,46 +1558,41 @@ def evaluate_market_regime(
         if spy_idx >= long_sma_days - 1
         else None
     )
-    qqq_close = float(qqq_closes[qqq_idx])
-    qqq_sma20 = float(np.mean(qqq_closes[qqq_idx - (fast_sma_days - 1) : qqq_idx + 1]))
-    qqq_sma50 = float(np.mean(qqq_closes[qqq_idx - (sma_days - 1) : qqq_idx + 1]))
     spy_prev_close = float(spy_closes[spy_idx - momentum_days])
-    qqq_prev_close = float(qqq_closes[qqq_idx - momentum_days]) if qqq_idx >= momentum_days else np.nan
     spy_return_5d = (spy_close / spy_prev_close) - 1.0 if spy_prev_close > 0 else np.nan
-    qqq_return_5d = (qqq_close / qqq_prev_close) - 1.0 if qqq_prev_close > 0 else np.nan
+
+    qqq_close = qqq_sma20 = qqq_sma50 = qqq_return_5d = None
+    if qqq_series is not None:
+        qqq_dates, _qqq_opens, _qqq_highs, _qqq_lows, qqq_closes = qqq_series
+        qqq_idx = int(np.searchsorted(qqq_dates, rank_date_int, side="right") - 1)
+        if qqq_idx >= sma_days - 1:
+            qqq_close = float(qqq_closes[qqq_idx])
+            qqq_sma20 = float(np.mean(qqq_closes[qqq_idx - (fast_sma_days - 1) : qqq_idx + 1]))
+            qqq_sma50 = float(np.mean(qqq_closes[qqq_idx - (sma_days - 1) : qqq_idx + 1]))
+            qqq_prev_close = float(qqq_closes[qqq_idx - momentum_days])
+            qqq_return_5d = (qqq_close / qqq_prev_close) - 1.0 if qqq_prev_close > 0 else np.nan
 
     spy_above_sma = spy_close > spy_sma50
-    qqq_above_sma = qqq_close > qqq_sma50
     spy_momentum_ok = np.isfinite(spy_return_5d) and spy_return_5d > min_spy_return_5d
-    qqq_momentum_ok = np.isfinite(qqq_return_5d) and qqq_return_5d > min_qqq_return_5d
     spy_above_long_sma = spy_sma200 is not None and spy_close > spy_sma200
     spy_ma_aligned = spy_sma20 > spy_sma50
-    qqq_ma_aligned = qqq_sma20 > qqq_sma50
-    entry_allowed = spy_above_sma and qqq_above_sma and spy_momentum_ok
+    entry_allowed = spy_above_sma and spy_momentum_ok
     if mode == "aggressive":
         entry_allowed = (
             entry_allowed
-            and qqq_momentum_ok
             and spy_above_long_sma
             and spy_ma_aligned
-            and qqq_ma_aligned
         )
     failed_checks = []
     if not spy_above_sma:
         failed_checks.append("SPY <= 50DMA")
-    if not qqq_above_sma:
-        failed_checks.append("QQQ <= 50DMA")
     if not spy_momentum_ok:
         failed_checks.append("SPY 5D <= 0%" if mode == "aggressive" else "SPY 5D <= -2%")
     if mode == "aggressive":
-        if not qqq_momentum_ok:
-            failed_checks.append("QQQ 5D <= 0%")
         if not spy_above_long_sma:
             failed_checks.append("SPY <= 200DMA")
         if not spy_ma_aligned:
             failed_checks.append("SPY 20DMA <= 50DMA")
-        if not qqq_ma_aligned:
-            failed_checks.append("QQQ 20DMA <= 50DMA")
     regime = "Risk-On"
     if not entry_allowed:
         regime = "Risk-Off" if len(failed_checks) >= 2 or not spy_momentum_ok else "Neutral"
@@ -1805,7 +1794,7 @@ def build_investment_simulation_rows(
             entry_price = float(first_am_bar["open"])
             entry_time = first_am_bar["datetime"].strftime("%I:%M %p ET")
             data_source = "Polygon 1-min AM extended hours"
-        elif entry_allowed and intraday_exit_source != "daily" and polygon_api_key:
+        elif intraday_exit_source != "daily" and polygon_api_key:
             minute_bars = fetch_polygon_minute_bars(symbol, entry_date, entry_date)
             first_regular_bar = next((bar for bar in minute_bars if bar["date"] == entry_date), None)
             if first_regular_bar is not None:
@@ -1816,7 +1805,8 @@ def build_investment_simulation_rows(
             continue
 
         investment_amount = position_size if entry_allowed else 0.0
-        shares = investment_amount / entry_price if entry_allowed else 0.0
+        hypothetical_shares = position_size / entry_price
+        shares = hypothetical_shares if entry_allowed else 0.0
         target_price = entry_price * (1.0 + gain_pct)
         stop_price = entry_price * (1.0 - loss_pct)
         end_idx = min(start_idx + follow_days, len(dates))
@@ -1827,59 +1817,63 @@ def build_investment_simulation_rows(
         exit_price: float | None = None
         exit_reason = "Open - waiting for threshold or day 5" if entry_allowed else "Market regime blocked entry"
 
-        if entry_allowed:
-            intraday_price, intraday_dt, intraday_reason, intraday_source = intraday_exit(
-                symbol,
-                entry_date,
-                dates,
-                start_idx,
-                target_price,
-                stop_price,
-            )
-            if intraday_price is not None and intraday_dt is not None:
+        intraday_price, intraday_dt, intraday_reason, intraday_source = intraday_exit(
+            symbol,
+            entry_date,
+            dates,
+            start_idx,
+            target_price,
+            stop_price,
+        )
+        if intraday_price is not None and intraday_dt is not None:
+            if entry_allowed:
                 status = "Closed"
-                exit_date = intraday_dt.date()
-                exit_time = intraday_dt.strftime("%I:%M %p ET")
-                exit_price = intraday_price
-                exit_reason = intraday_reason
-                data_source = intraday_source
-            else:
-                for idx in range(start_idx, end_idx):
-                    high_val = float(highs[idx])
-                    low_val = float(lows[idx])
-                    hit_target = high_val >= target_price
-                    hit_stop = low_val <= stop_price
-                    if hit_target and hit_stop:
+            exit_date = intraday_dt.date()
+            exit_time = intraday_dt.strftime("%I:%M %p ET")
+            exit_price = intraday_price
+            exit_reason = intraday_reason
+            data_source = intraday_source
+        else:
+            for idx in range(start_idx, end_idx):
+                high_val = float(highs[idx])
+                low_val = float(lows[idx])
+                hit_target = high_val >= target_price
+                hit_stop = low_val <= stop_price
+                if hit_target and hit_stop:
+                    if entry_allowed:
                         status = "Closed"
-                        exit_date = date_from_int(int(dates[idx]))
-                        exit_time = "Unavailable with daily OHLC"
-                        exit_price = stop_price
-                        exit_reason = "Both hit same day - assumed -1% first"
-                        break
-                    if hit_stop:
+                    exit_date = date_from_int(int(dates[idx]))
+                    exit_time = "Unavailable with daily OHLC"
+                    exit_price = stop_price
+                    exit_reason = "Both hit same day - assumed -1% first"
+                    break
+                if hit_stop:
+                    if entry_allowed:
                         status = "Closed"
-                        exit_date = date_from_int(int(dates[idx]))
-                        exit_time = "Unavailable with daily OHLC"
-                        exit_price = stop_price
-                        exit_reason = "-1% stop"
-                        break
-                    if hit_target:
+                    exit_date = date_from_int(int(dates[idx]))
+                    exit_time = "Unavailable with daily OHLC"
+                    exit_price = stop_price
+                    exit_reason = "-1% stop"
+                    break
+                if hit_target:
+                    if entry_allowed:
                         status = "Closed"
-                        exit_date = date_from_int(int(dates[idx]))
-                        exit_time = "Unavailable with daily OHLC"
-                        exit_price = target_price
-                        exit_reason = "+2% target"
-                        break
+                    exit_date = date_from_int(int(dates[idx]))
+                    exit_time = "Unavailable with daily OHLC"
+                    exit_price = target_price
+                    exit_reason = "+2% target"
+                    break
 
-        if entry_allowed and exit_price is None and end_idx - start_idx >= follow_days:
+        if exit_price is None and end_idx - start_idx >= follow_days:
             final_idx = end_idx - 1
-            status = "Closed"
+            if entry_allowed:
+                status = "Closed"
             exit_date = date_from_int(int(dates[final_idx]))
             exit_time = "Market Close"
             exit_price = float(closes[final_idx])
             exit_reason = "Max 5 trading days"
 
-        result_currency = (shares * exit_price) - investment_amount if exit_price is not None else None
+        result_currency = (hypothetical_shares * exit_price) - position_size if exit_price is not None else None
         result_pct = (exit_price / entry_price) - 1.0 if exit_price is not None else None
         rows.append(
             {
@@ -2206,7 +2200,7 @@ def write_investment_dashboard_sheet(
     ws.freeze_panes = f"A{table_header_row + 1}"
     auto_size_columns(ws, min_width=10, max_width=35)
     ws.column_dimensions["B"].width = 18
-    write_summary_sheet(wb, [row for row in simulation_rows if row["status"] != "Blocked"])
+    write_summary_sheet(wb, simulation_rows, include_market_status=True)
 
 
 def remove_inactive_report_sheets(wb: Workbook) -> None:
@@ -2240,7 +2234,7 @@ def write_summary_only_sheet(
         intraday_exit_source=intraday_exit_source,
         market_regimes=market_regimes,
     )
-    write_summary_sheet(wb, [row for row in simulation_rows if row["status"] != "Blocked"])
+    write_summary_sheet(wb, simulation_rows, include_market_status=True)
 
     am_simulation_rows = build_investment_simulation_rows(
         cohorts,
@@ -2254,9 +2248,10 @@ def write_summary_only_sheet(
     )
     write_summary_sheet(
         wb,
-        [row for row in am_simulation_rows if row["status"] != "Blocked"],
+        am_simulation_rows,
         sheet_name=AM_SIMULATION_SHEET_NAME,
         include_entry_time=True,
+        include_market_status=True,
     )
 
 
@@ -2265,6 +2260,7 @@ def write_summary_sheet(
     simulation_rows: list[dict[str, Any]],
     sheet_name: str = SUMMARY_SHEET_NAME,
     include_entry_time: bool = False,
+    include_market_status: bool = False,
 ) -> None:
     if LEGACY_SUMMARY_SHEET_NAME in wb.sheetnames and SUMMARY_SHEET_NAME not in wb.sheetnames:
         wb[LEGACY_SUMMARY_SHEET_NAME].title = SUMMARY_SHEET_NAME
@@ -2301,6 +2297,8 @@ def write_summary_sheet(
         "Result\n%",
         "# of Days open",
     ]
+    if include_market_status:
+        headers.append("SPY - Market Condition")
     ws.append(headers)
 
     summary_rows = []
@@ -2312,7 +2310,7 @@ def write_summary_sheet(
         if not isinstance(exit_date, date):
             exit_date = None
         status = str(row.get("status", "")).strip()
-        is_closed = status == "Closed" or (not status and exit_date is not None)
+        is_closed = exit_date is not None
         output_row = [
             row.get("symbol"),
             row.get("rank_date"),
@@ -2328,6 +2326,9 @@ def write_summary_sheet(
             row.get("result_pct") if exit_date else None,
             _trading_days_open(entry_date, exit_date) if is_closed else None,
         ]
+        if include_market_status:
+            included = status != "Blocked"
+            output_row.append(row.get("market_reason") if not included else "Good")
         summary_rows.append(output_row)
 
     for output_row in summary_rows:
@@ -2341,20 +2342,35 @@ def write_summary_sheet(
     result_currency_col = 7 + shift
     result_pct_col = 8 + shift
     last_col = 9 + shift
+    if include_market_status:
+        last_col += 1
     ws.cell(row=total_label_row, column=result_currency_col, value="TOTAL")
     ws.cell(row=total_label_row, column=result_pct_col, value="TOTAL")
     if summary_rows:
         result_currency_letter = get_column_letter(result_currency_col)
         result_pct_letter = get_column_letter(result_pct_col)
+        if include_market_status:
+            condition_letter = get_column_letter(last_col)
+            currency_formula = (
+                f'=SUMIF({condition_letter}{data_start_row}:{condition_letter}{data_end_row},"Good",'
+                f'{result_currency_letter}{data_start_row}:{result_currency_letter}{data_end_row})'
+            )
+            pct_formula = (
+                f'=SUMIF({condition_letter}{data_start_row}:{condition_letter}{data_end_row},"Good",'
+                f'{result_pct_letter}{data_start_row}:{result_pct_letter}{data_end_row})'
+            )
+        else:
+            currency_formula = f"=SUM({result_currency_letter}{data_start_row}:{result_currency_letter}{data_end_row})"
+            pct_formula = f"=SUM({result_pct_letter}{data_start_row}:{result_pct_letter}{data_end_row})"
         ws.cell(
             row=total_formula_row,
             column=result_currency_col,
-            value=f"=SUM({result_currency_letter}{data_start_row}:{result_currency_letter}{data_end_row})",
+            value=currency_formula,
         )
         ws.cell(
             row=total_formula_row,
             column=result_pct_col,
-            value=f"=SUM({result_pct_letter}{data_start_row}:{result_pct_letter}{data_end_row})",
+            value=pct_formula,
         )
     else:
         ws.cell(row=total_formula_row, column=result_currency_col, value=0)
@@ -2391,6 +2407,9 @@ def write_summary_sheet(
         "H": 13.0,
         "I": 13.0,
         "J": 13.0,
+        "K": 13.0,
+        "L": 13.0,
+        "M": 13.0,
     }
     for col_letter, width in column_widths.items():
         ws.column_dimensions[col_letter].width = width
@@ -2458,6 +2477,18 @@ def write_summary_sheet(
                 include_bottom = False
             cell.border = summary_border(col_idx, row_idx, include_top=include_top, include_bottom=include_bottom)
 
+    if include_market_status:
+        market_condition_col = last_col
+        ws.column_dimensions[get_column_letter(market_condition_col)].width = 42.0
+        red_fill = PatternFill(fill_type="solid", fgColor="F4CCCC")
+        red_font = Font(name="Calibri", size=11, bold=True, color="9C0006")
+        for row_idx, simulation_row in enumerate(simulation_rows, start=2):
+            if str(simulation_row.get("status", "")).strip() != "Blocked":
+                continue
+            for col_idx in range(1, last_col + 1):
+                ws.cell(row=row_idx, column=col_idx).fill = red_fill
+            ws.cell(row=row_idx, column=market_condition_col).font = red_font
+
     ws.freeze_panes = None
 
 
@@ -2473,10 +2504,16 @@ def prune_old_run_sheets(
         keep_runs = 0
     keep_protected = protected_names or PROTECTED_SHEET_NAMES
     run_sheet_names = [name for name in wb.sheetnames if name not in keep_protected]
-    remove_count = len(run_sheet_names) - keep_runs
+    permanently_retained = {
+        name
+        for name in run_sheet_names
+        if (_parse_run_sheet_date(name) or date.min) >= SIMULATION_START_DATE
+    }
+    removable_names = [name for name in run_sheet_names if name not in permanently_retained]
+    remove_count = len(removable_names) - keep_runs
     if remove_count <= 0:
         return
-    for name in run_sheet_names[:remove_count]:
+    for name in removable_names[:remove_count]:
         del wb[name]
 
 
@@ -2776,8 +2813,8 @@ def main() -> None:
         default=MARKET_REGIME_DEFAULT_MODE,
         help=(
             "Market-regime entry gate for the Investment Dashboard. "
-            "standard uses SPY/QQQ > 50DMA and SPY 5D > -2%; "
-            "aggressive also requires SPY > 200DMA, SPY/QQQ 20DMA > 50DMA, and SPY/QQQ 5D > 0%."
+            "standard uses SPY > 50DMA and SPY 5D > -2%; "
+            "aggressive also requires SPY > 200DMA, SPY 20DMA > 50DMA, and SPY 5D > 0%."
         ),
     )
 

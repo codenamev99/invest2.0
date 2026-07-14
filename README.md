@@ -30,7 +30,7 @@ The Polygon updater can bootstrap a missing `data 2` folder from Polygon daily b
 
 If your Polygon subscription includes intraday aggregates, the screener's `Investment Dashboard` will use Polygon 1-minute regular-market bars to decide whether the +2% target or -1% stop happened first. If `POLYGON_API_KEY` is not set, it falls back to daily OHLC logic.
 
-The `Investment Dashboard` also applies a market-regime gate to new simulated entries using the same daily OHLC data. The default `--market_regime_mode aggressive` allows new entries only when SPY is above its 50-day and 200-day moving averages, QQQ is above its 50-day moving average, SPY/QQQ 20-day moving averages are above their 50-day moving averages, and both SPY and QQQ have positive 5-day returns. To return to the previous simpler version, run with `--market_regime_mode standard`, which requires only SPY/QQQ above their 50-day moving averages and SPY's 5-day return better than -2%.
+The `Investment Dashboard` also applies a SPY-only market-regime gate to new simulated entries using the same daily OHLC data. The default `--market_regime_mode aggressive` allows new entries only when SPY is above its 50-day and 200-day moving averages, its 20-day moving average is above its 50-day moving average, and its 5-day return is positive. To use the simpler version, run with `--market_regime_mode standard`, which requires SPY above its 50-day moving average and a 5-day return better than -2%.
 
 Optional Polygon variables:
 ```
