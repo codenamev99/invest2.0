@@ -20,6 +20,9 @@ from openpyxl.styles import Alignment, Border, Color, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 
+AS_OF_DATE_INT: int | None = None
+
+
 # -----------------------------
 # Portable path handling
 # -----------------------------
@@ -99,6 +102,9 @@ def load_series_from_file(
             close = float(parts[7])
             vol = float(parts[8])
         except ValueError:
+            continue
+
+        if AS_OF_DATE_INT is not None and date_i > AS_OF_DATE_INT:
             continue
 
         rows.append((date_i, close, vol, high, low))
@@ -2501,11 +2507,17 @@ _BENCH_MAP: dict[int, float] = {}
 _NEED_ROWS = 0
 
 
-def _init_worker(bench_map: dict[int, float], params: dict[str, Any], need_rows: int) -> None:
-    global _WORKER_PARAMS, _BENCH_MAP, _NEED_ROWS
+def _init_worker(
+    bench_map: dict[int, float],
+    params: dict[str, Any],
+    need_rows: int,
+    as_of_date_int: int | None,
+) -> None:
+    global _WORKER_PARAMS, _BENCH_MAP, _NEED_ROWS, AS_OF_DATE_INT
     _WORKER_PARAMS = params
     _BENCH_MAP = bench_map
     _NEED_ROWS = need_rows
+    AS_OF_DATE_INT = as_of_date_int
 
 
 def screen_symbol(
@@ -2738,6 +2750,11 @@ def main() -> None:
         help='Output Excel (.xlsx) path (supports ${workspaceFolder}, ~, env vars)',
     )
     ap.add_argument(
+        "--as_of_date",
+        default="",
+        help="Run the screener using data available through YYYY-MM-DD (for historical backfills).",
+    )
+    ap.add_argument(
         "--alphavantage_api_key",
         default=ALPHAVANTAGE_API_KEY,
         help="Alpha Vantage API key (defaults to hardcoded project key).",
@@ -2860,6 +2877,13 @@ def main() -> None:
     )
 
     args = ap.parse_args()
+
+    global AS_OF_DATE_INT
+    if args.as_of_date:
+        try:
+            AS_OF_DATE_INT = int(datetime.strptime(args.as_of_date, "%Y-%m-%d").strftime("%Y%m%d"))
+        except ValueError as exc:
+            raise SystemExit("--as_of_date must use YYYY-MM-DD.") from exc
 
     if args.avg_vol_days is not None and args.avg_vol_days <= 0:
         raise SystemExit("--avg_vol_days must be > 0")
@@ -3011,7 +3035,7 @@ def main() -> None:
             with ProcessPoolExecutor(
                 max_workers=workers,
                 initializer=_init_worker,
-                initargs=(bench_map, params, need_rows),
+                initargs=(bench_map, params, need_rows, AS_OF_DATE_INT),
             ) as ex:
                 for res in ex.map(_screen_symbol_worker, tasks, chunksize=chunksize):
                     if res:
@@ -3032,7 +3056,8 @@ def main() -> None:
     if results:
         symbols = [str(row.get("symbol", "")).strip().upper() for row in results]
         session = requests.Session()
-        earnings_map = fetch_nasdaq_earnings_dates(symbols, session, today=date.today())
+        earnings_reference_date = date_from_int(AS_OF_DATE_INT) if AS_OF_DATE_INT is not None else date.today()
+        earnings_map = fetch_nasdaq_earnings_dates(symbols, session, today=earnings_reference_date)
         for row in results:
             symbol = str(row.get("symbol", "")).strip().upper()
             info = earnings_map.get(symbol, {})
@@ -3201,7 +3226,7 @@ def main() -> None:
                 row["total_score"] = None
                 row["rank"] = None
     if results and args.score_enable:
-        score_today = date.today()
+        score_today = data_date
         eligible = [row for row in results if is_score_eligible(row, score_today)]
         liquidity_values = [to_float(row.get("avg_dollar_volume")) for row in eligible]
         liquidity_values = [val for val in liquidity_values if val is not None]
