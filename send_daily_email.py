@@ -15,6 +15,7 @@ RESULTS_PATH = Path(os.environ.get("RESULTS_FILE", "results.xlsx"))
 UPCOMING_IPOS_SHEET_NAME = "Upcoming IPOs (60D)"
 UPCOMING_EARNINGS_SHEET_NAME = "Upcoming Earnings (14D)"
 SIMULATION_SHEET_NAME = "Simulation"
+AM_SIMULATION_SHEET_NAME = "AM Simulation"
 LEGACY_SIMULATION_SHEET_NAME = "Summary"
 PROTECTED_SHEETS = {
     "Single Tickers",
@@ -22,6 +23,7 @@ PROTECTED_SHEETS = {
     UPCOMING_EARNINGS_SHEET_NAME,
     "Top 10 OHLC Tracking",
     SIMULATION_SHEET_NAME,
+    AM_SIMULATION_SHEET_NAME,
     LEGACY_SIMULATION_SHEET_NAME,
     "Investment Dashboard",
 }
@@ -184,13 +186,10 @@ def upcoming_ipos_table(wb) -> str:
     return worksheet_table(wb, UPCOMING_IPOS_SHEET_NAME, max_rows=20)
 
 
-def simulation_totals_html(wb) -> str:
-    sheet_name = next(
-        (name for name in (SIMULATION_SHEET_NAME, LEGACY_SIMULATION_SHEET_NAME) if name in wb.sheetnames),
-        None,
-    )
+def simulation_sheet_totals_html(wb, sheet_names: tuple[str, ...], label: str) -> str:
+    sheet_name = next((name for name in sheet_names if name in wb.sheetnames), None)
     if sheet_name is None:
-        return "<p>Simulated Portfolio totals: Simulation sheet not found.</p>"
+        return f"<p>{html.escape(label)} totals: Simulation sheet not found.</p>"
 
     ws = wb[sheet_name]
     total_label_row = None
@@ -204,7 +203,7 @@ def simulation_totals_html(wb) -> str:
             break
 
     if total_label_row is None:
-        return "<p>Simulated Portfolio totals: TOTAL row not found.</p>"
+        return f"<p>{html.escape(label)} totals: TOTAL row not found.</p>"
 
     total_formula_row = total_label_row + 1
     dollar_value = ws.cell(row=total_formula_row, column=7).value
@@ -225,7 +224,21 @@ def simulation_totals_html(wb) -> str:
 
     dollar_total = format_value(dollar_value, '"$"#,##0.00')
     percent_total = format_value(percent_value, "0.00%")
-    return f"<p><strong>Simulated Portfolio totals:</strong> {html.escape(dollar_total)} and {html.escape(percent_total)}.</p>"
+    return f"<p><strong>{html.escape(label)} totals:</strong> {html.escape(dollar_total)} and {html.escape(percent_total)}.</p>"
+
+
+def simulation_totals_html(wb) -> str:
+    regular_totals = simulation_sheet_totals_html(
+        wb,
+        (SIMULATION_SHEET_NAME, LEGACY_SIMULATION_SHEET_NAME),
+        "Simulated Portfolio",
+    )
+    am_totals = simulation_sheet_totals_html(
+        wb,
+        (AM_SIMULATION_SHEET_NAME,),
+        "AM Simulated Portfolio",
+    )
+    return regular_totals + am_totals
 
 
 def build_email_html() -> tuple[str, str]:
