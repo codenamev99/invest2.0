@@ -1794,47 +1794,131 @@ def build_investment_simulation_rows(
 
         return None, None, "", ""
 
+    def append_ignored_row(
+        cohort: dict[str, Any],
+        symbol: str,
+        entry_date: date | None,
+        reason: str,
+        market_regime: dict[str, Any],
+    ) -> None:
+        rows.append(
+            {
+                "rank_date": cohort["rank_date"],
+                "rank": int(cohort["rank"]),
+                "symbol": symbol,
+                "entry_date": entry_date,
+                "entry_time": "",
+                "entry_price": None,
+                "shares": 0.0,
+                "investment": 0.0,
+                "exit_date": None,
+                "exit_time": "",
+                "exit_price": None,
+                "exit_reason": reason,
+                "status": "Ignored",
+                "result_currency": None,
+                "result_pct": None,
+                "data_source": "Unavailable",
+                "market_regime": market_regime.get("regime", ""),
+                "market_entry_allowed": "No",
+                "market_reason": reason,
+            }
+        )
+
     for cohort in cohorts:
         symbol = str(cohort["symbol"]).strip().upper()
         normalized = normalize_symbol(symbol)
+        rank_date = cohort["rank_date"]
+        market_regime = (market_regimes or {}).get(rank_date, {})
+        next_market_idx = int(np.searchsorted(market_dates, date_to_int(rank_date), side="right"))
+        if next_market_idx >= len(market_dates):
+            append_ignored_row(
+                cohort,
+                symbol,
+                None,
+                "Ignored: next trading day is not available yet.",
+                market_regime,
+            )
+            continue
+        required_entry_date_int = int(market_dates[next_market_idx])
+        required_entry_date = date_from_int(required_entry_date_int)
+
         path = symbol_paths.get(normalized)
         if path is None:
             path = find_symbol_file(root, normalized)
         if path is None:
+            append_ignored_row(
+                cohort,
+                symbol,
+                required_entry_date,
+                "Ignored: no local daily price file is available for this symbol.",
+                market_regime,
+            )
             continue
 
         if normalized not in ohlc_cache:
             ohlc_cache[normalized] = load_ohlc_from_file(path)
         dates, opens, highs, lows, closes = ohlc_cache[normalized]
         if len(dates) == 0:
+            append_ignored_row(
+                cohort,
+                symbol,
+                required_entry_date,
+                "Ignored: the local price file contains no usable daily data.",
+                market_regime,
+            )
             continue
 
-        rank_date = cohort["rank_date"]
-        market_regime = (market_regimes or {}).get(rank_date, {})
         entry_allowed = bool(market_regime.get("entry_allowed", True))
-        next_market_idx = int(np.searchsorted(market_dates, date_to_int(rank_date), side="right"))
-        if next_market_idx >= len(market_dates):
-            continue
-        required_entry_date_int = int(market_dates[next_market_idx])
         start_idx = int(np.searchsorted(dates, date_to_int(rank_date), side="right"))
         if start_idx >= len(dates) or int(dates[start_idx]) != required_entry_date_int:
+            append_ignored_row(
+                cohort,
+                symbol,
+                required_entry_date,
+                f"Ignored: daily OHLC is missing for the required {required_entry_date:%b %d, %Y} entry.",
+                market_regime,
+            )
             continue
 
         entry_date = date_from_int(int(dates[start_idx]))
         entry_price = float(opens[start_idx])
         entry_time = "Market Open"
         data_source = "Daily OHLC"
+        entry_fallback_reason = ""
         if entry_session == "am":
-            # Daily OHLC has no extended-hours price, so an AM entry requires Polygon.
-            if not polygon_api_key:
-                continue
-            minute_bars = fetch_polygon_minute_bars(symbol, entry_date, entry_date, session="am")
+            minute_bars = (
+                fetch_polygon_minute_bars(symbol, entry_date, entry_date, session="am")
+                if polygon_api_key
+                else []
+            )
             first_am_bar = next((bar for bar in minute_bars if bar["date"] == entry_date), None)
             if first_am_bar is None:
-                continue
-            entry_price = float(first_am_bar["open"])
-            entry_time = first_am_bar["datetime"].strftime("%I:%M %p ET")
-            data_source = "Polygon 1-min AM extended hours"
+                regular_bars = (
+                    fetch_polygon_minute_bars(symbol, entry_date, entry_date, session="regular")
+                    if polygon_api_key
+                    else []
+                )
+                first_regular_bar = next(
+                    (bar for bar in regular_bars if bar["date"] == entry_date),
+                    None,
+                )
+                if first_regular_bar is not None:
+                    entry_price = float(first_regular_bar["open"])
+                    entry_time = first_regular_bar["datetime"].strftime("%I:%M %p ET")
+                    data_source = "Polygon 1-min regular-hours fallback"
+                else:
+                    entry_price = float(opens[start_idx])
+                    entry_time = "Market Open"
+                    data_source = "Daily OHLC regular-hours fallback"
+                entry_fallback_reason = (
+                    "Good - AM extended-hours data unavailable; used the first available "
+                    "regular-hours price."
+                )
+            else:
+                entry_price = float(first_am_bar["open"])
+                entry_time = first_am_bar["datetime"].strftime("%I:%M %p ET")
+                data_source = "Polygon 1-min AM extended hours"
         elif intraday_exit_source != "daily" and polygon_api_key:
             minute_bars = fetch_polygon_minute_bars(symbol, entry_date, entry_date)
             first_regular_bar = next((bar for bar in minute_bars if bar["date"] == entry_date), None)
@@ -1843,6 +1927,13 @@ def build_investment_simulation_rows(
                 entry_time = first_regular_bar["datetime"].strftime("%I:%M %p ET")
                 data_source = "Polygon 1-min"
         if entry_price <= 0:
+            append_ignored_row(
+                cohort,
+                symbol,
+                entry_date,
+                "Ignored: the required entry price is missing or invalid.",
+                market_regime,
+            )
             continue
 
         investment_amount = position_size if entry_allowed else 0.0
@@ -1937,6 +2028,7 @@ def build_investment_simulation_rows(
                 "market_regime": market_regime.get("regime", ""),
                 "market_entry_allowed": "Yes" if entry_allowed else "No",
                 "market_reason": market_regime.get("reason", ""),
+                "entry_fallback_reason": entry_fallback_reason,
             }
         )
 
@@ -2333,6 +2425,7 @@ def write_summary_sheet(
         headers.append("Entry\nTime")
     headers += [
         "Exit\nDate",
+        "Exit\nTime",
         "Exit\nPrice",
         "Result\n$",
         "Result\n%",
@@ -2362,14 +2455,18 @@ def write_summary_sheet(
             output_row.append(row.get("entry_time"))
         output_row += [
             exit_date,
+            row.get("exit_time") if exit_date else None,
             row.get("exit_price") if exit_date else None,
             row.get("result_currency") if exit_date else None,
             row.get("result_pct") if exit_date else None,
             _trading_days_open(entry_date, exit_date) if is_closed else None,
         ]
         if include_market_status:
-            included = status != "Blocked"
-            output_row.append(row.get("market_reason") if not included else "Good")
+            if status in {"Blocked", "Ignored"}:
+                condition = row.get("market_reason")
+            else:
+                condition = row.get("entry_fallback_reason") or "Good"
+            output_row.append(condition)
         summary_rows.append(output_row)
 
     for output_row in summary_rows:
@@ -2380,9 +2477,12 @@ def write_summary_sheet(
     total_label_row = data_end_row + 3 if summary_rows else 4
     total_formula_row = total_label_row + 1
     shift = 1 if include_entry_time else 0
-    result_currency_col = 7 + shift
-    result_pct_col = 8 + shift
-    last_col = 9 + shift
+    exit_date_col = 5 + shift
+    exit_price_col = 7 + shift
+    result_currency_col = 8 + shift
+    result_pct_col = 9 + shift
+    days_open_col = 10 + shift
+    last_col = days_open_col
     if include_market_status:
         last_col += 1
     ws.cell(row=total_label_row, column=result_currency_col, value="TOTAL")
@@ -2393,11 +2493,11 @@ def write_summary_sheet(
         if include_market_status:
             condition_letter = get_column_letter(last_col)
             currency_formula = (
-                f'=SUMIF({condition_letter}{data_start_row}:{condition_letter}{data_end_row},"Good",'
+                f'=SUMIF({condition_letter}{data_start_row}:{condition_letter}{data_end_row},"Good*",'
                 f'{result_currency_letter}{data_start_row}:{result_currency_letter}{data_end_row})'
             )
             pct_formula = (
-                f'=SUMIF({condition_letter}{data_start_row}:{condition_letter}{data_end_row},"Good",'
+                f'=SUMIF({condition_letter}{data_start_row}:{condition_letter}{data_end_row},"Good*",'
                 f'{result_pct_letter}{data_start_row}:{result_pct_letter}{data_end_row})'
             )
         else:
@@ -2470,8 +2570,9 @@ def write_summary_sheet(
             left = thin_light_gray
         if col_idx == last_col:
             right = thin_light_gray
-        thick_left_cols = {3, 5 + shift, 7 + shift, 9 + shift}
-        thick_right_cols = {2, 4, 6 + shift, 8 + shift}
+        entry_group_end = 4 + shift
+        thick_left_cols = {3, exit_date_col, result_currency_col, days_open_col}
+        thick_right_cols = {2, entry_group_end, exit_price_col, result_pct_col}
         if col_idx in thick_left_cols:
             left = thick_black
         if col_idx in thick_right_cols:
@@ -2501,9 +2602,9 @@ def write_summary_sheet(
             if col_idx == 1:
                 cell.font = symbol_font
                 cell.number_format = "@"
-            elif col_idx in {2, 3, 5 + shift}:
+            elif col_idx in {2, 3, exit_date_col}:
                 cell.number_format = date_format
-            elif col_idx in {4, 6 + shift}:
+            elif col_idx in {4, exit_price_col}:
                 cell.number_format = currency_format
             elif col_idx == result_currency_col:
                 cell.font = total_font if row_idx == total_label_row else result_font
@@ -2523,12 +2624,19 @@ def write_summary_sheet(
         ws.column_dimensions[get_column_letter(market_condition_col)].width = 42.0
         red_fill = PatternFill(fill_type="solid", fgColor="F4CCCC")
         red_font = Font(name="Calibri", size=11, bold=True, color="9C0006")
+        ignored_fill = PatternFill(fill_type="solid", fgColor="FFF2CC")
+        ignored_font = Font(name="Calibri", size=11, bold=True, color="7F6000")
         for row_idx, simulation_row in enumerate(simulation_rows, start=2):
-            if str(simulation_row.get("status", "")).strip() != "Blocked":
+            row_status = str(simulation_row.get("status", "")).strip()
+            used_regular_fallback = bool(simulation_row.get("entry_fallback_reason"))
+            if row_status not in {"Blocked", "Ignored"} and not used_regular_fallback:
                 continue
+            row_fill = red_fill if row_status == "Blocked" else ignored_fill
             for col_idx in range(1, last_col + 1):
-                ws.cell(row=row_idx, column=col_idx).fill = red_fill
-            ws.cell(row=row_idx, column=market_condition_col).font = red_font
+                ws.cell(row=row_idx, column=col_idx).fill = row_fill
+            ws.cell(row=row_idx, column=market_condition_col).font = (
+                red_font if row_status == "Blocked" else ignored_font
+            )
 
     ws.freeze_panes = None
 

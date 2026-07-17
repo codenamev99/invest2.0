@@ -240,11 +240,20 @@ def simulation_sheet_totals_html(wb, sheet_names: tuple[str, ...], label: str) -
         return f"<p>{html.escape(label)} totals: Simulation sheet not found.</p>"
 
     ws = wb[sheet_name]
+    normalized_headers = [
+        str(ws.cell(row=1, column=col_idx).value or "").replace("\n", " ").strip().lower()
+        for col_idx in range(1, ws.max_column + 1)
+    ]
+    try:
+        result_currency_col = normalized_headers.index("result $") + 1
+        result_pct_col = normalized_headers.index("result %") + 1
+    except ValueError:
+        return f"<p>{html.escape(label)} totals: Result columns not found.</p>"
     total_label_row = None
     for row_idx in range(1, ws.max_row + 1):
         labels = {
-            str(ws.cell(row=row_idx, column=7).value or "").strip().upper(),
-            str(ws.cell(row=row_idx, column=8).value or "").strip().upper(),
+            str(ws.cell(row=row_idx, column=result_currency_col).value or "").strip().upper(),
+            str(ws.cell(row=row_idx, column=result_pct_col).value or "").strip().upper(),
         }
         if "TOTAL" in labels:
             total_label_row = row_idx
@@ -254,20 +263,20 @@ def simulation_sheet_totals_html(wb, sheet_names: tuple[str, ...], label: str) -
         return f"<p>{html.escape(label)} totals: TOTAL row not found.</p>"
 
     total_formula_row = total_label_row + 1
-    dollar_value = ws.cell(row=total_formula_row, column=7).value
-    percent_value = ws.cell(row=total_formula_row, column=8).value
+    dollar_value = ws.cell(row=total_formula_row, column=result_currency_col).value
+    percent_value = ws.cell(row=total_formula_row, column=result_pct_col).value
 
     if not isinstance(dollar_value, (int, float)):
         dollar_value = sum(
-            float(ws.cell(row=row_idx, column=7).value or 0)
+            float(ws.cell(row=row_idx, column=result_currency_col).value or 0)
             for row_idx in range(2, total_label_row)
-            if isinstance(ws.cell(row=row_idx, column=7).value, (int, float))
+            if isinstance(ws.cell(row=row_idx, column=result_currency_col).value, (int, float))
         )
     if not isinstance(percent_value, (int, float)):
         percent_value = sum(
-            float(ws.cell(row=row_idx, column=8).value or 0)
+            float(ws.cell(row=row_idx, column=result_pct_col).value or 0)
             for row_idx in range(2, total_label_row)
-            if isinstance(ws.cell(row=row_idx, column=8).value, (int, float))
+            if isinstance(ws.cell(row=row_idx, column=result_pct_col).value, (int, float))
         )
 
     dollar_total = format_value(dollar_value, '"$"#,##0.00')
