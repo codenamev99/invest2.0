@@ -17,6 +17,7 @@ UPCOMING_EARNINGS_SHEET_NAME = "Upcoming Earnings (14D)"
 SIMULATION_SHEET_NAME = "Simulation"
 AM_SIMULATION_SHEET_NAME = "AM Simulation"
 LEGACY_SIMULATION_SHEET_NAME = "Summary"
+DAILY_RUNS_SHEET_NAME = "Daily Runs"
 PROTECTED_SHEETS = {
     "Single Tickers",
     UPCOMING_IPOS_SHEET_NAME,
@@ -26,6 +27,7 @@ PROTECTED_SHEETS = {
     AM_SIMULATION_SHEET_NAME,
     LEGACY_SIMULATION_SHEET_NAME,
     "Investment Dashboard",
+    DAILY_RUNS_SHEET_NAME,
 }
 
 
@@ -144,6 +146,41 @@ def worksheet_table(wb, sheet_name: str, max_rows: int | None = None) -> str:
 
 
 def ranked_stocks_table(wb) -> tuple[str, str]:
+    if DAILY_RUNS_SHEET_NAME in wb.sheetnames:
+        ws = wb[DAILY_RUNS_SHEET_NAME]
+        headers = [str(cell.value or "").strip().lower() for cell in ws[1]]
+        try:
+            date_col = headers.index("run date") + 1
+            symbol_col = headers.index("symbol") + 1
+        except ValueError:
+            date_col, symbol_col = 1, 2
+        company_col = next((i + 1 for i, value in enumerate(headers) if value == "company"), 3)
+        rank_col = next((i + 1 for i, value in enumerate(headers) if value == "rank"), None)
+        close_col = next((i + 1 for i, value in enumerate(headers) if "close" in value and "$" in value), 6)
+        earnings_cols = [i + 1 for i, value in enumerate(headers) if value == "earnings"]
+        next_earnings_col = (earnings_cols[-1] + 1) if earnings_cols else ws.max_column
+        run_dates = [
+            parse_run_date_value(ws.cell(row=row_idx, column=date_col).value)
+            for row_idx in range(3, ws.max_row + 1)
+        ]
+        latest_date = max((value for value in run_dates if value is not None), default=None)
+        selected_cols = [("Symbol", symbol_col), ("Company", company_col)]
+        if rank_col:
+            selected_cols.append(("Rank", rank_col))
+        selected_cols.extend([("Close", close_col), ("Next Earnings", next_earnings_col)])
+        rows: list[list[str]] = []
+        for row_idx in range(3, ws.max_row + 1):
+            if parse_run_date_value(ws.cell(row=row_idx, column=date_col).value) != latest_date:
+                continue
+            rows.append([
+                format_value(ws.cell(row=row_idx, column=col_idx).value, ws.cell(row=row_idx, column=col_idx).number_format)
+                for _, col_idx in selected_cols
+            ])
+            if len(rows) >= 10:
+                break
+        title_date = latest_date.strftime("%d %b %Y") if latest_date else "Latest"
+        return f"Latest Ranked Stocks ({html.escape(title_date)})", html_table([label for label, _ in selected_cols], rows)
+
     sheet_name = latest_run_sheet_name(wb.sheetnames)
     if not sheet_name:
         return "Latest Ranked Stocks", "<p>No ranked stock sheet was found.</p>"
@@ -180,6 +217,17 @@ def ranked_stocks_table(wb) -> tuple[str, str]:
     headers = [label for label, _ in selected_cols]
     title = f"Latest Ranked Stocks ({html.escape(sheet_name)})"
     return title, html_table(headers, rows)
+
+
+def parse_run_date_value(value: Any) -> date | None:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return datetime.strptime(str(value).strip(), "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
 
 
 def upcoming_ipos_table(wb) -> str:

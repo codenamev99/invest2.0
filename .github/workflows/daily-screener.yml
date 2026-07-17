@@ -52,7 +52,7 @@ jobs:
         env:
           POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
           POLYGON_BOOTSTRAP_YEARS: ${{ vars.POLYGON_BOOTSTRAP_YEARS || '2' }}
-          POLYGON_BACKFILL_DAYS: ${{ vars.POLYGON_BACKFILL_DAYS || '30' }}
+          POLYGON_BACKFILL_DAYS: ${{ vars.POLYGON_BACKFILL_DAYS || '60' }}
           SKIP_PIP_INSTALL: "1"
         run: bash ./run_daily.sh
 

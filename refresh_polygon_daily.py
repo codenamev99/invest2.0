@@ -4,15 +4,21 @@ import argparse
 import os
 import shutil
 import time
+import warnings
 from collections import OrderedDict
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+warnings.filterwarnings(
+    "ignore",
+    message=r"urllib3 v2 only supports OpenSSL 1\.1\.1\+.*",
+)
 import requests
 
 
 GROUPED_DAILY_URL = "https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{date}"
+TICKER_DAILY_URL = "https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}"
 REFERENCE_TICKERS_URL = "https://api.polygon.io/v3/reference/tickers"
 STOOQ_HEADER = "<TICKER>,<PER>,<DATE>,<TIME>,<OPEN>,<HIGH>,<LOW>,<CLOSE>,<VOL>,<OPENINT>"
 
@@ -72,6 +78,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Include the current calendar day in latest-date, backfill, and bootstrap requests. "
             "Use this only when the job runs after the market has closed."
+        ),
+    )
+    ap.add_argument(
+        "--ensure-benchmark-history-days",
+        type=int,
+        default=0,
+        help=(
+            "Ensure SPY.US and QQQ.US contain this many recent calendar days of daily history "
+            "using Polygon's per-ticker aggregate endpoint. Disabled by default."
         ),
     )
     ap.add_argument(
@@ -209,6 +224,62 @@ def fetch_grouped_daily(
         raise RuntimeError(f"Polygon returned status {status!r}: {message}")
 
     return list(payload.get("results") or [])
+
+
+def ensure_benchmark_history(
+    root: Path,
+    api_key: str,
+    calendar_days: int,
+    adjusted: bool,
+    include_today: bool,
+    dry_run: bool,
+) -> None:
+    """Repair SPY/QQQ history with two targeted Polygon aggregate requests."""
+    if calendar_days <= 0:
+        return
+    end = date.today() if include_today else date.today() - timedelta(days=1)
+    start = end - timedelta(days=calendar_days - 1)
+    symbol_paths = build_file_map(root)
+
+    for symbol in ("SPY.US", "QQQ.US"):
+        path = symbol_paths.get(symbol) or root / "etfs" / symbol_to_file_name(symbol)
+        polygon_symbol = symbol.removesuffix(".US")
+        resp = requests.get(
+            TICKER_DAILY_URL.format(
+                ticker=polygon_symbol,
+                start=start.isoformat(),
+                end=end.isoformat(),
+            ),
+            params={
+                "adjusted": str(adjusted).lower(),
+                "sort": "asc",
+                "limit": 50000,
+                "apiKey": api_key,
+            },
+            timeout=60,
+        )
+        if resp.status_code in {401, 403}:
+            raise RuntimeError(f"Polygon rejected the API key while repairing {symbol} history.")
+        resp.raise_for_status()
+        rows = resp.json().get("results") or []
+        counts = {"added": 0, "updated": 0, "unchanged": 0}
+        for bar in rows:
+            timestamp_ms = bar.get("t")
+            if timestamp_ms is None:
+                continue
+            trading_date = datetime.utcfromtimestamp(float(timestamp_ms) / 1000.0).date()
+            row = stooq_row(symbol, trading_date, bar)
+            action = upsert_daily_row(
+                path,
+                row,
+                int(trading_date.strftime("%Y%m%d")),
+                dry_run=dry_run,
+            )
+            counts[action] += 1
+        print(
+            f"Ensured {symbol} history {start.isoformat()} to {end.isoformat()}: "
+            f"added={counts['added']}, updated={counts['updated']}, unchanged={counts['unchanged']}"
+        )
 
 
 def fetch_grouped_daily_with_retries(
@@ -621,6 +692,14 @@ def main() -> None:
         if args.backfill_days <= 0:
             raise SystemExit("--backfill-days must be > 0.")
         backfill_recent_days(args, root, new_symbols_dir, api_key)
+        ensure_benchmark_history(
+            root,
+            api_key,
+            calendar_days=args.ensure_benchmark_history_days,
+            adjusted=not args.unadjusted,
+            include_today=args.include_today,
+            dry_run=args.dry_run,
+        )
         return
 
     if args.date:

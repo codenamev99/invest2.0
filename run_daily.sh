@@ -30,7 +30,7 @@ RESULTS_FILE="$PROJECT_DIR/results.xlsx"
 ROOT_DATA="$PROJECT_DIR/data 2/daily/us"
 BENCHMARK="SPY.US"
 POLYGON_BOOTSTRAP_YEARS="${POLYGON_BOOTSTRAP_YEARS:-2}"
-POLYGON_BACKFILL_DAYS="${POLYGON_BACKFILL_DAYS:-30}"
+POLYGON_BACKFILL_DAYS="${POLYGON_BACKFILL_DAYS:-60}"
 
 # Existing terminals may not inherit keys set later through macOS launchctl.
 # Pull the local GUI/user environment key when the shell variable is empty.
@@ -45,7 +45,7 @@ if [ -n "${POLYGON_API_KEY:-}" ]; then
     echo "NYSE data folder missing; bootstrapping ${POLYGON_BOOTSTRAP_YEARS} years from Polygon."
     $PYTHON_CMD refresh_polygon_daily.py --bootstrap --include-today --root "$ROOT_DATA" --bootstrap-years "$POLYGON_BOOTSTRAP_YEARS"
   fi
-  $PYTHON_CMD refresh_polygon_daily.py --include-today --root "$ROOT_DATA" --backfill-days "$POLYGON_BACKFILL_DAYS"
+  $PYTHON_CMD refresh_polygon_daily.py --include-today --ensure-benchmark-history-days 400 --root "$ROOT_DATA" --backfill-days "$POLYGON_BACKFILL_DAYS"
 elif [ -n "$STOOQ_SRC" ]; then
   $PYTHON_CMD refresh_stooq_dump.py --src "$STOOQ_SRC" --dest "$DATA_DEST" --mode "$STOOQ_MODE"
 else

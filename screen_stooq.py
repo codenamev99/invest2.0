@@ -5,6 +5,7 @@ import calendar
 import csv
 import io
 import os
+import warnings
 from bisect import bisect_left, bisect_right
 from datetime import date, datetime, timedelta
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
@@ -13,6 +14,10 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import numpy as np
+warnings.filterwarnings(
+    "ignore",
+    message=r"urllib3 v2 only supports OpenSSL 1\.1\.1\+.*",
+)
 import requests
 from scipy.signal import lfilter
 from openpyxl import Workbook, load_workbook
@@ -475,6 +480,7 @@ SUMMARY_SHEET_NAME = "Simulation"
 AM_SIMULATION_SHEET_NAME = "AM Simulation"
 SIMULATION_START_DATE = date(2026, 6, 12)
 LEGACY_SUMMARY_SHEET_NAME = "Summary"
+DAILY_RUNS_SHEET_NAME = "Daily Runs"
 TOP10_OHLC_HIDDEN_COLUMNS = ("F", "G", "H", "M", "P")
 TOP10_OHLC_TRAILING_HIDDEN_COLUMNS = ("R",)
 PROTECTED_SHEET_NAMES = {
@@ -486,6 +492,7 @@ PROTECTED_SHEET_NAMES = {
     SUMMARY_SHEET_NAME,
     AM_SIMULATION_SHEET_NAME,
     LEGACY_SUMMARY_SHEET_NAME,
+    DAILY_RUNS_SHEET_NAME,
 }
 
 
@@ -1008,6 +1015,72 @@ def _parse_run_sheet_date(sheet_name: str) -> date | None:
         return None
 
 
+def iter_run_rows(wb: Workbook):
+    """Yield (run_date, headers, row) from consolidated and legacy run sheets."""
+    if DAILY_RUNS_SHEET_NAME in wb.sheetnames:
+        ws = wb[DAILY_RUNS_SHEET_NAME]
+        headers = [str(cell.value or "").strip().lower() for cell in ws[1]]
+        for row in ws.iter_rows(min_row=3, values_only=True):
+            run_date = _coerce_date(row[0] if row else None)
+            if run_date is not None:
+                yield run_date, headers[1:], row[1:]
+    for name in wb.sheetnames:
+        run_date = _parse_run_sheet_date(name)
+        if run_date is None:
+            continue
+        ws = wb[name]
+        headers = [str(cell.value or "").strip().lower() for cell in ws[1]]
+        for row in ws.iter_rows(min_row=3, values_only=True):
+            if row and row[0] is not None:
+                yield run_date, headers, row
+
+
+def prepare_daily_runs_sheet(wb: Workbook, header_row: list[Any]):
+    """Migrate legacy date tabs into one newest-first Daily Runs table."""
+    records: list[tuple[date, tuple[Any, ...]]] = []
+    if DAILY_RUNS_SHEET_NAME in wb.sheetnames:
+        old_ws = wb[DAILY_RUNS_SHEET_NAME]
+        for row in old_ws.iter_rows(min_row=3, values_only=True):
+            run_date = _coerce_date(row[0] if row else None)
+            if run_date is not None:
+                records.append((run_date, tuple(row[1:])))
+
+    legacy_names: list[str] = []
+    for name in wb.sheetnames:
+        run_date = _parse_run_sheet_date(name)
+        if run_date is None:
+            continue
+        legacy_names.append(name)
+        old_ws = wb[name]
+        for row in old_ws.iter_rows(min_row=3, values_only=True):
+            if row and row[0] is not None:
+                records.append((run_date, tuple(row)))
+
+    for name in legacy_names:
+        del wb[name]
+    if DAILY_RUNS_SHEET_NAME in wb.sheetnames:
+        ws = wb[DAILY_RUNS_SHEET_NAME]
+        for merged_range in list(ws.merged_cells.ranges):
+            ws.unmerge_cells(str(merged_range))
+        clear_sheet(ws)
+    elif len(wb.sheetnames) == 1 and is_empty_sheet(wb.active):
+        ws = wb.active
+        ws.title = DAILY_RUNS_SHEET_NAME
+    else:
+        ws = wb.create_sheet(DAILY_RUNS_SHEET_NAME, 0)
+
+    ws.append(header_row)
+    ws.append([None] * len(header_row))
+    previous_date: date | None = None
+    for run_date, row in sorted(records, key=lambda item: item[0], reverse=True):
+        if previous_date is not None and run_date != previous_date:
+            ws.append([None] * len(header_row))
+        values = [run_date, *row]
+        ws.append(values[: len(header_row)] + [None] * max(0, len(header_row) - len(values)))
+        previous_date = run_date
+    return ws
+
+
 def count_recent_symbol_occurrences(
     wb: Workbook,
     max_runs: int = 5,
@@ -1021,26 +1094,16 @@ def count_recent_symbol_occurrences(
     if max_runs <= 0 or not wb.sheetnames:
         return {}
 
-    latest_sheet_by_date: dict[date, str] = {}
-    for name in wb.sheetnames:
-        if name in PROTECTED_SHEET_NAMES:
-            continue
-        run_date = _parse_run_sheet_date(name)
-        if run_date is None:
-            continue
-        if before_date is not None and run_date >= before_date:
-            continue
-        latest_sheet_by_date[run_date] = name
-
-    recent_dates = sorted(latest_sheet_by_date)[-max_runs:]
-    recent_names = [latest_sheet_by_date[run_date] for run_date in recent_dates]
+    rows_by_date: dict[date, list[tuple[Any, ...]]] = {}
+    for run_date, _headers, row in iter_run_rows(wb):
+        if before_date is None or run_date < before_date:
+            rows_by_date.setdefault(run_date, []).append(row)
+    recent_dates = sorted(rows_by_date)[-max_runs:]
     counts: dict[str, int] = {}
-    for name in recent_names:
-        ws = wb[name]
-        if is_empty_sheet(ws):
-            continue
+    for run_date in recent_dates:
         symbols_in_sheet: set[str] = set()
-        for (val,) in ws.iter_rows(min_row=3, max_row=ws.max_row, min_col=1, max_col=1, values_only=True):
+        for row in rows_by_date[run_date]:
+            val = row[0] if row else None
             if val is None:
                 continue
             sym = str(val).strip().upper()
@@ -1062,24 +1125,16 @@ def collect_qualified_result_dates(
     """
     qualified_dates: dict[str, date] = {}
 
-    for name in wb.sheetnames:
-        if name in PROTECTED_SHEET_NAMES:
+    for sheet_date, _headers, row in iter_run_rows(wb):
+        val = row[0] if row else None
+        if val is None:
             continue
-        sheet_date = _parse_run_sheet_date(name)
-        if sheet_date is None:
+        sym = str(val).strip().upper()
+        if not sym:
             continue
-        ws = wb[name]
-        if is_empty_sheet(ws):
-            continue
-        for (val,) in ws.iter_rows(min_row=3, max_row=ws.max_row, min_col=1, max_col=1, values_only=True):
-            if val is None:
-                continue
-            sym = str(val).strip().upper()
-            if not sym:
-                continue
-            existing = qualified_dates.get(sym)
-            if existing is None or sheet_date > existing:
-                qualified_dates[sym] = sheet_date
+        existing = qualified_dates.get(sym)
+        if existing is None or sheet_date > existing:
+            qualified_dates[sym] = sheet_date
 
     if current_results and current_date is not None:
         for row in current_results:
@@ -1163,29 +1218,10 @@ def collect_top_ranked_cohorts(wb: Workbook, top_n: int = 10) -> list[dict[str, 
     Read workbook run sheets and return ranked ticker cohorts for OHLC tracking.
     """
     cohorts: list[dict[str, Any]] = []
-    run_sheets_by_date: dict[date, str] = {}
-    for name in wb.sheetnames:
-        if name in PROTECTED_SHEET_NAMES:
-            continue
-        rank_date = _parse_run_sheet_date(name)
-        if rank_date is None:
-            continue
+    seen_cohorts: set[tuple[date, int, str]] = set()
+    for rank_date, headers, row in iter_run_rows(wb):
         if rank_date < SIMULATION_START_DATE:
             continue
-        # If a workbook has duplicate run sheets for the same date, use the last
-        # one in workbook order and avoid double-counting its top ranked tickers.
-        run_sheets_by_date[rank_date] = name
-
-    seen_cohorts: set[tuple[date, int, str]] = set()
-    for rank_date, name in run_sheets_by_date.items():
-        ws = wb[name]
-        if is_empty_sheet(ws) or ws.max_row < 3:
-            continue
-
-        headers = [
-            str(cell.value).strip().lower() if cell.value is not None else ""
-            for cell in ws[1]
-        ]
         try:
             rank_idx = headers.index("rank")
         except ValueError:
@@ -1197,25 +1233,24 @@ def collect_top_ranked_cohorts(wb: Workbook, top_n: int = 10) -> list[dict[str, 
         if close_idx is None:
             continue
 
-        for row in ws.iter_rows(min_row=3, values_only=True):
-            rank = _coerce_int(row[rank_idx] if rank_idx < len(row) else None)
-            if rank is None or rank < 1 or rank > top_n:
-                continue
-            symbol = str(row[0] if row and row[0] is not None else "").strip().upper()
-            if not symbol:
-                continue
-            cohort_key = (rank_date, rank, symbol)
-            if cohort_key in seen_cohorts:
-                continue
-            seen_cohorts.add(cohort_key)
-            cohorts.append(
-                {
-                    "rank_date": rank_date,
-                    "rank": rank,
-                    "symbol": symbol,
-                    "rank_close": _coerce_float(row[close_idx] if close_idx < len(row) else None),
-                }
-            )
+        rank = _coerce_int(row[rank_idx] if rank_idx < len(row) else None)
+        if rank is None or rank < 1 or rank > top_n:
+            continue
+        symbol = str(row[0] if row and row[0] is not None else "").strip().upper()
+        if not symbol:
+            continue
+        cohort_key = (rank_date, rank, symbol)
+        if cohort_key in seen_cohorts:
+            continue
+        seen_cohorts.add(cohort_key)
+        cohorts.append(
+            {
+                "rank_date": rank_date,
+                "rank": rank,
+                "symbol": symbol,
+                "rank_close": _coerce_float(row[close_idx] if close_idx < len(row) else None),
+            }
+        )
 
     cohorts.sort(key=lambda r: (r["rank_date"], int(r["rank"]), str(r["symbol"])))
     return cohorts
@@ -1634,6 +1669,8 @@ def build_investment_simulation_rows(
     rows: list[dict[str, Any]] = []
     ohlc_cache: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
     intraday_cache: dict[tuple[str, date, date, str], list[dict[str, Any]]] = {}
+    market_series = _market_symbol_series(MARKET_REGIME_SPY, symbol_paths, root, ohlc_cache)
+    market_dates = market_series[0] if market_series is not None else np.array([], dtype=np.int32)
 
     def polygon_ticker(symbol: str) -> str:
         return normalize_symbol(symbol).removesuffix(".US")
@@ -1775,8 +1812,12 @@ def build_investment_simulation_rows(
         rank_date = cohort["rank_date"]
         market_regime = (market_regimes or {}).get(rank_date, {})
         entry_allowed = bool(market_regime.get("entry_allowed", True))
+        next_market_idx = int(np.searchsorted(market_dates, date_to_int(rank_date), side="right"))
+        if next_market_idx >= len(market_dates):
+            continue
+        required_entry_date_int = int(market_dates[next_market_idx])
         start_idx = int(np.searchsorted(dates, date_to_int(rank_date), side="right"))
-        if start_idx >= len(dates):
+        if start_idx >= len(dates) or int(dates[start_idx]) != required_entry_date_int:
             continue
 
         entry_date = date_from_int(int(dates[start_idx]))
@@ -1899,7 +1940,7 @@ def build_investment_simulation_rows(
             }
         )
 
-    rows.sort(key=lambda r: (r["entry_date"], int(r["rank"]), str(r["symbol"])))
+    rows.sort(key=lambda r: (r["rank_date"], int(r["rank"]), str(r["symbol"])))
     return rows
 
 
@@ -3185,7 +3226,7 @@ def main() -> None:
         out_path = out_path.with_suffix(".xlsx")
 
     header_row = [
-        None,
+        "Symbol",
         "Company",
         "Prev 5x",
         " Close $",
@@ -3243,11 +3284,14 @@ def main() -> None:
     if args.score_enable:
         header_row = header_row[:2] + ["Rank"] + header_row[2:]
         data_keys = data_keys[:2] + ["rank"] + data_keys[2:]
+    header_row = ["Run Date"] + header_row
     data_date = date_from_int(int(bd[-1])) if len(bd) else date.today()
     headline = data_date.strftime("%d %b %Y").upper()
 
     if out_path.exists():
         wb = load_workbook(out_path)
+        if run_mode == "all":
+            prepare_daily_runs_sheet(wb, header_row)
         prev_counts = count_recent_symbol_occurrences(wb, max_runs=5, before_date=data_date) if run_mode == "all" else {}
     else:
         wb = Workbook()
@@ -3303,29 +3347,8 @@ def main() -> None:
         else:
             ws = wb.create_sheet(title="Single Tickers")
     else:
-        sheet_name = headline
-        if len(wb.sheetnames) == 1 and is_empty_sheet(wb.active):
-            ws = wb.active
-            ws.title = sheet_name
-        else:
-            existing_names = [
-                name
-                for name in wb.sheetnames
-                if name not in PROTECTED_SHEET_NAMES and _parse_run_sheet_date(name) == data_date
-            ]
-            sheet_to_reuse = sheet_name if sheet_name in existing_names else (existing_names[-1] if existing_names else "")
-            for name in existing_names:
-                if name != sheet_to_reuse:
-                    del wb[name]
-            if sheet_to_reuse:
-                ws = wb[sheet_to_reuse]
-                clear_sheet(ws)
-                if ws.title != sheet_name:
-                    ws.title = sheet_name
-            else:
-                ws = wb.create_sheet(title=sheet_name)
-
-        ws.append(header_row)
+        sheet_name = DAILY_RUNS_SHEET_NAME
+        ws = prepare_daily_runs_sheet(wb, header_row) if DAILY_RUNS_SHEET_NAME not in wb.sheetnames else wb[DAILY_RUNS_SHEET_NAME]
 
     if args.beta_freq == "monthly":
         beta_desc = f"{args.beta_months} months\n> {args.beta_min}"
@@ -3373,8 +3396,10 @@ def main() -> None:
     ]
     if args.score_enable:
         descriptors = descriptors[:2] + [None] + descriptors[2:]
+    descriptors = [None] + descriptors
     if run_mode == "all":
-        ws.append(descriptors)
+        for col_idx, value in enumerate(descriptors, start=1):
+            ws.cell(row=2, column=col_idx, value=value)
 
     def parse_mmddyyyy(value: Any) -> datetime | None:
         if not value:
@@ -3471,11 +3496,30 @@ def main() -> None:
         symbol = str(row.get("symbol", "")).strip().upper()
         return (rank is None, rank if rank is not None else daily_order, symbol)
 
+    new_run_rows: list[list[Any]] = []
     for row in sorted(daily_output_rows, key=daily_result_sort_key):
         symbol_display = str(row.get("symbol", "")).strip()
         symbol_key = symbol_display.upper()
         prev_count = int(prev_counts.get(symbol_key, 0))
-        ws.append(build_output_row(row, prev_count))
+        new_run_rows.append([data_date] + build_output_row(row, prev_count))
+
+    for row_idx in range(ws.max_row, 2, -1):
+        if _coerce_date(ws.cell(row=row_idx, column=1).value) == data_date:
+            ws.delete_rows(row_idx)
+    if new_run_rows:
+        has_older_run = any(
+            _coerce_date(ws.cell(row=row_idx, column=1).value) is not None
+            for row_idx in range(3, ws.max_row + 1)
+        )
+        separator_already_at_top = has_older_run and all(
+            ws.cell(row=3, column=col_idx).value is None
+            for col_idx in range(1, ws.max_column + 1)
+        )
+        rows_to_insert = len(new_run_rows) + (1 if has_older_run and not separator_already_at_top else 0)
+        ws.insert_rows(3, amount=rows_to_insert)
+        for row_offset, values in enumerate(new_run_rows, start=3):
+            for col_idx, value in enumerate(values, start=1):
+                ws.cell(row=row_offset, column=col_idx, value=value)
 
     black = Color(indexed=8)
     white = Color(indexed=9)
@@ -3506,21 +3550,20 @@ def main() -> None:
     score_shift = 1 if args.score_enable else 0
 
     def shift_col_idx(idx: int) -> int:
-        if score_shift == 0 or idx <= 2:
-            return idx
-        return idx + score_shift
+        return idx + 1 + (score_shift if idx > 2 else 0)
 
     def shift_cols(cols: set[int]) -> set[int]:
         return {shift_col_idx(col) for col in cols}
 
     header_style_cols = shift_cols({1, 2, 3, 4, 6, 8, 10, 12, 14, 16, 17, 19, 21, 23, 25})
     header_value_cols = shift_cols({2, 3, 4, 6, 8, 10, 12, 14, 16, 17, 19, 21, 23, 25})
+    header_style_cols.add(1)
     if args.score_enable:
-        header_style_cols.update({3})
-        header_value_cols.update({3})
+        header_style_cols.update({4})
+        header_value_cols.update({4})
     left_thick_cols = shift_cols({4, 6, 8, 10, 12, 14, 16, 17, 19, 21, 23, 25})
     right_thick_cols = shift_cols({5, 7, 9, 11, 13, 15, 16, 18, 20, 22, 24, 26})
-    header_right_cols = {shift_col_idx(25), shift_col_idx(26)} if args.score_enable else {25, 26}
+    header_right_cols = {shift_col_idx(25), shift_col_idx(26)}
 
     # Column widths from the sample spreadsheet
     base_column_widths = {
@@ -3552,10 +3595,11 @@ def main() -> None:
         26: 13.0,
     }
     column_widths = (
-        {shift_col_idx(k): v for k, v in base_column_widths.items()} if args.score_enable else base_column_widths
+        {shift_col_idx(k): v for k, v in base_column_widths.items()}
     )
+    column_widths[1] = 13.0
     if args.score_enable:
-        column_widths[3] = 6.0
+        column_widths[4] = 6.0
     for col_idx, width in column_widths.items():
         ws.column_dimensions[get_column_letter(col_idx)].width = width
 
@@ -3626,17 +3670,27 @@ def main() -> None:
     }
     number_formats = (
         {shift_col_idx(k): v for k, v in base_number_formats.items()}
-        if args.score_enable
-        else base_number_formats
     )
+    number_formats[1] = "mmm d, yyyy"
     if args.score_enable:
-        number_formats[3] = "0"
+        number_formats[4] = "0"
 
     for row_idx in range(3, ws.max_row + 1):
+        is_separator = all(
+            ws.cell(row=row_idx, column=col_idx).value is None
+            for col_idx in range(1, ws.max_column + 1)
+        )
+        if is_separator:
+            ws.row_dimensions[row_idx].height = 7.0
+            for col_idx in range(1, ws.max_column + 1):
+                cell = ws.cell(row=row_idx, column=col_idx)
+                cell.fill = descriptor_fill
+                cell.border = Border()
+            continue
         for col_idx in range(1, ws.max_column + 1):
             cell = ws.cell(row=row_idx, column=col_idx)
-            cell.fill = black_fill if col_idx == 1 else white_fill
-            if col_idx == 1:
+            cell.fill = black_fill if col_idx == 2 else white_fill
+            if col_idx == 2:
                 cell.font = symbol_font
             elif col_idx in bold_cols:
                 cell.font = bold_font
