@@ -64,7 +64,15 @@ def parse_args() -> argparse.Namespace:
         "--backfill-days",
         type=int,
         default=0,
-        help="Fetch and upsert every weekday in the last N calendar days, ending yesterday.",
+        help="Fetch and upsert every weekday in the last N calendar days, ending yesterday by default.",
+    )
+    ap.add_argument(
+        "--include-today",
+        action="store_true",
+        help=(
+            "Include the current calendar day in latest-date, backfill, and bootstrap requests. "
+            "Use this only when the job runs after the market has closed."
+        ),
     )
     ap.add_argument(
         "--new-symbols-dir",
@@ -108,7 +116,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--bootstrap-end",
         default="",
-        help="Bootstrap end date, YYYY-MM-DD. Defaults to yesterday.",
+        help="Bootstrap end date, YYYY-MM-DD. Defaults to yesterday, or today with --include-today.",
     )
     ap.add_argument(
         "--bootstrap-universe",
@@ -157,15 +165,15 @@ def build_file_map(root: Path) -> dict[str, Path]:
     return mp
 
 
-def candidate_dates(lookback_days: int) -> list[date]:
-    # Start at yesterday so a scheduled morning run does not ask for today's incomplete bar.
-    start = date.today() - timedelta(days=1)
+def candidate_dates(lookback_days: int, include_today: bool = False) -> list[date]:
+    # Morning/default runs avoid today's incomplete bar; post-close runs may opt in.
+    start = date.today() if include_today else date.today() - timedelta(days=1)
     return [start - timedelta(days=i) for i in range(max(1, lookback_days))]
 
 
-def backfill_candidate_dates(backfill_days: int) -> list[date]:
-    start = date.today() - timedelta(days=max(1, backfill_days))
-    end = date.today() - timedelta(days=1)
+def backfill_candidate_dates(backfill_days: int, include_today: bool = False) -> list[date]:
+    end = date.today() if include_today else date.today() - timedelta(days=1)
+    start = end - timedelta(days=max(1, backfill_days) - 1)
     return [
         start + timedelta(days=i)
         for i in range((end - start).days + 1)
@@ -277,7 +285,8 @@ def fetch_reference_symbols(api_key: str, rate_limit_sleep: float) -> tuple[set[
 
 
 def bootstrap_date_range(args: argparse.Namespace) -> list[date]:
-    end = parse_yyyy_mm_dd(args.bootstrap_end) if args.bootstrap_end else date.today() - timedelta(days=1)
+    default_end = date.today() if args.include_today else date.today() - timedelta(days=1)
+    end = parse_yyyy_mm_dd(args.bootstrap_end) if args.bootstrap_end else default_end
     if args.bootstrap_start:
         start = parse_yyyy_mm_dd(args.bootstrap_start)
     else:
@@ -422,9 +431,10 @@ def find_latest_grouped_data(
     lookback_days: int,
     adjusted: bool,
     include_otc: bool,
+    include_today: bool = False,
 ) -> tuple[date, list[dict[str, Any]]]:
     errors: list[str] = []
-    for d in candidate_dates(lookback_days):
+    for d in candidate_dates(lookback_days, include_today=include_today):
         try:
             rows = fetch_grouped_daily(api_key, d, adjusted, include_otc)
         except RuntimeError:
@@ -548,7 +558,7 @@ def merge_counts(total: dict[str, int], counts: dict[str, int]) -> None:
 
 
 def backfill_recent_days(args: argparse.Namespace, root: Path, new_symbols_dir: Path | None, api_key: str) -> None:
-    dates = backfill_candidate_dates(args.backfill_days)
+    dates = backfill_candidate_dates(args.backfill_days, include_today=args.include_today)
     if not dates:
         raise SystemExit("--backfill-days did not produce any weekdays to fetch.")
 
@@ -624,6 +634,7 @@ def main() -> None:
             lookback_days=args.lookback_days,
             adjusted=not args.unadjusted,
             include_otc=args.include_otc,
+            include_today=args.include_today,
         )
 
     symbol_paths = build_file_map(root)

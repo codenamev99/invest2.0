@@ -43,9 +43,9 @@ fi
 if [ -n "${POLYGON_API_KEY:-}" ]; then
   if [ ! -d "$ROOT_DATA/nyse stocks" ]; then
     echo "NYSE data folder missing; bootstrapping ${POLYGON_BOOTSTRAP_YEARS} years from Polygon."
-    $PYTHON_CMD refresh_polygon_daily.py --bootstrap --root "$ROOT_DATA" --bootstrap-years "$POLYGON_BOOTSTRAP_YEARS"
+    $PYTHON_CMD refresh_polygon_daily.py --bootstrap --include-today --root "$ROOT_DATA" --bootstrap-years "$POLYGON_BOOTSTRAP_YEARS"
   fi
-  $PYTHON_CMD refresh_polygon_daily.py --root "$ROOT_DATA" --backfill-days "$POLYGON_BACKFILL_DAYS"
+  $PYTHON_CMD refresh_polygon_daily.py --include-today --root "$ROOT_DATA" --backfill-days "$POLYGON_BACKFILL_DAYS"
 elif [ -n "$STOOQ_SRC" ]; then
   $PYTHON_CMD refresh_stooq_dump.py --src "$STOOQ_SRC" --dest "$DATA_DEST" --mode "$STOOQ_MODE"
 else

@@ -40,13 +40,13 @@ rem -------- Daily Steps --------
 if not "%POLYGON_API_KEY%"=="" (
     if not exist "%ROOT_DATA%\nyse stocks" (
         echo NYSE data folder missing; bootstrapping %POLYGON_BOOTSTRAP_YEARS% years from Polygon.
-        %PYTHON_CMD% refresh_polygon_daily.py --bootstrap --root "%ROOT_DATA%" --bootstrap-years "%POLYGON_BOOTSTRAP_YEARS%"
+        %PYTHON_CMD% refresh_polygon_daily.py --bootstrap --include-today --root "%ROOT_DATA%" --bootstrap-years "%POLYGON_BOOTSTRAP_YEARS%"
         if errorlevel 1 (
             echo ERROR: Polygon bootstrap failed. Check POLYGON_API_KEY, plan history, and rate limits.
             exit /b 1
         )
     )
-    %PYTHON_CMD% refresh_polygon_daily.py --root "%ROOT_DATA%" --backfill-days "%POLYGON_BACKFILL_DAYS%"
+    %PYTHON_CMD% refresh_polygon_daily.py --include-today --root "%ROOT_DATA%" --backfill-days "%POLYGON_BACKFILL_DAYS%"
     if errorlevel 1 (
         echo ERROR: refresh_polygon_daily.py failed. Check POLYGON_API_KEY and your data path, then retry.
         exit /b 1
