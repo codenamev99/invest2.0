@@ -913,31 +913,31 @@ def pct_change(current: float, previous: float) -> float:
     return (current - previous) / previous * 100.0
 
 
-def max_close_and_days_ago(
+def max_value_and_days_ago(
     dates: np.ndarray,
-    closes: np.ndarray,
+    values: np.ndarray,
     last_date: date,
     cutoff_int: int | None = None,
 ) -> tuple[float | None, int | None]:
     """
-    Max close (most recent if tied) and calendar days since that date.
+    Max value (most recent if tied) and calendar days since that date.
     Optionally restrict to dates >= cutoff_int (YYYYMMDD).
     """
-    if len(dates) == 0 or len(closes) == 0:
+    if len(dates) == 0 or len(values) == 0:
         return None, None
     if cutoff_int is not None:
         mask = dates >= cutoff_int
         if not np.any(mask):
             return None, None
         dates = dates[mask]
-        closes = closes[mask]
-    max_close = float(np.max(closes))
-    idxs = np.where(closes == max_close)[0]
+        values = values[mask]
+    max_value = float(np.max(values))
+    idxs = np.where(values == max_value)[0]
     if len(idxs) == 0:
         return None, None
     max_date_int = int(dates[idxs[-1]])
     days_ago = (last_date - date_from_int(max_date_int)).days
-    return max_close, int(days_ago)
+    return max_value, int(days_ago)
 
 
 def last_close_5pct_higher_info(
@@ -2785,8 +2785,8 @@ def screen_symbol(
 
     cutoff_52_date = last_date - timedelta(days=364)
     cutoff_52_int = date_to_int(cutoff_52_date)
-    high_52_close, high_52_days = max_close_and_days_ago(d, c, last_date, cutoff_52_int)
-    high_all_close, high_all_days = max_close_and_days_ago(d, c, last_date, None)
+    high_52, high_52_days = max_value_and_days_ago(d, h, last_date, cutoff_52_int)
+    high_all, high_all_days = max_value_and_days_ago(d, h, last_date, None)
     last_5pct_date, last_5pct_days = last_close_5pct_higher_info(d, c, last_close, last_date)
 
     # RSI filter
@@ -2896,9 +2896,9 @@ def screen_symbol(
         "symbol": display_symbol(sym),  # NO ".US" in output
         "last_close": last_close,
         "last_close_pct_5": close_pct_5,
-        "high_52w_close": high_52_close,
+        "high_52w_close": high_52,
         "high_52w_days_ago": high_52_days,
-        "high_all_close": high_all_close,
+        "high_all_close": high_all,
         "high_all_days_ago": high_all_days,
         "last_5pct_higher_date": last_5pct_date,
         "last_5pct_higher_days_ago": last_5pct_days,
