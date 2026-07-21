@@ -1768,6 +1768,12 @@ def build_investment_simulation_rows(
             return None, None, "", ""
         end_date = date_from_int(int(daily_dates[end_idx - 1]))
         bars = fetch_polygon_minute_bars(symbol, entry_date, end_date)
+        if entry_session == "am":
+            # An AM entry can fill hours before the regular-hours bars fetched
+            # above begin; without the entry day's AM bars too, a target/stop
+            # crossing between the AM fill and the 9:30 open is never seen.
+            am_bars = fetch_polygon_minute_bars(symbol, entry_date, entry_date, session="am")
+            bars = am_bars + bars
         if not bars:
             return None, None, "", ""
 

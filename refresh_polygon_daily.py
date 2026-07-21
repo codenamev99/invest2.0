@@ -154,8 +154,12 @@ def parse_args() -> argparse.Namespace:
 
 
 def normalize_polygon_symbol(symbol: str) -> str:
-    symbol = symbol.strip().upper()
-    if not symbol.endswith(".US"):
+    # Case is preserved deliberately: Polygon uses it to disambiguate distinct
+    # tickers that share the same letters (e.g. "TPC" common stock vs "TpC" a
+    # preferred share). Uppercasing here would silently merge unrelated
+    # instruments into the same output file.
+    symbol = symbol.strip()
+    if not symbol.upper().endswith(".US"):
         symbol = f"{symbol}.US"
     return symbol
 
