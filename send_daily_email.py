@@ -12,6 +12,7 @@ from openpyxl import load_workbook
 
 
 RESULTS_PATH = Path(os.environ.get("RESULTS_FILE", "results.xlsx"))
+RECENT_SPLITS_SHEET_NAME = "Recent Splits (90D)"
 UPCOMING_IPOS_SHEET_NAME = "Upcoming IPOs (60D)"
 UPCOMING_EARNINGS_SHEET_NAME = "Upcoming Earnings (14D)"
 SIMULATION_SHEET_NAME = "Simulation"
@@ -20,6 +21,7 @@ LEGACY_SIMULATION_SHEET_NAME = "Summary"
 DAILY_RUNS_SHEET_NAME = "Daily Runs"
 PROTECTED_SHEETS = {
     "Single Tickers",
+    RECENT_SPLITS_SHEET_NAME,
     UPCOMING_IPOS_SHEET_NAME,
     UPCOMING_EARNINGS_SHEET_NAME,
     "Top 10 OHLC Tracking",
