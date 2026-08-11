@@ -58,9 +58,9 @@ def upgrade_headers(ws, high_col: int) -> int:
     Bring a pre-existing sheet up to the current column layout and return the
     Post-Gap High column index.
 
-    Workbooks written before these columns existed end at the Earnings pair, so
-    the three new columns append in the same positions the screener now writes,
-    keeping later runs consistent with what this backfill produces.
+    Workbooks written before this column existed end at the Earnings pair, so it
+    appends in the same position the screener now writes, keeping later runs
+    consistent with what this backfill produces.
     """
     if str(ws.cell(row=1, column=high_col).value or "").strip().lower() == "all-time high":
         ws.cell(row=1, column=high_col, value="2Y High")
@@ -68,9 +68,6 @@ def upgrade_headers(ws, high_col: int) -> int:
     post_gap_col = ws.max_column + 1
     ws.cell(row=1, column=post_gap_col, value="Post-Gap High")
     ws.cell(row=2, column=post_gap_col, value=f"High since last\n>{ss.PRICE_BASIS_GAP_RATIO:g}x price gap")
-    ws.cell(row=1, column=post_gap_col + 1, value="Last Split")
-    ws.cell(row=2, column=post_gap_col + 1, value="Date")
-    ws.cell(row=2, column=post_gap_col + 2, value="From:To")
     return post_gap_col
 
 

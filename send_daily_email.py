@@ -12,6 +12,7 @@ from openpyxl import load_workbook
 
 
 RESULTS_PATH = Path(os.environ.get("RESULTS_FILE", "results.xlsx"))
+HOW_IT_WORKS_SHEET_NAME = "How It Works"
 RECENT_SPLITS_SHEET_NAME = "Recent Splits (90D)"
 UPCOMING_IPOS_SHEET_NAME = "Upcoming IPOs (60D)"
 UPCOMING_EARNINGS_SHEET_NAME = "Upcoming Earnings (14D)"
@@ -21,6 +22,7 @@ LEGACY_SIMULATION_SHEET_NAME = "Summary"
 DAILY_RUNS_SHEET_NAME = "Daily Runs"
 PROTECTED_SHEETS = {
     "Single Tickers",
+    HOW_IT_WORKS_SHEET_NAME,
     RECENT_SPLITS_SHEET_NAME,
     UPCOMING_IPOS_SHEET_NAME,
     UPCOMING_EARNINGS_SHEET_NAME,
@@ -158,8 +160,17 @@ def ranked_stocks_table(wb) -> tuple[str, str]:
             date_col, symbol_col = 1, 2
         company_col = next((i + 1 for i, value in enumerate(headers) if value == "company"), 3)
         rank_col = next((i + 1 for i, value in enumerate(headers) if value == "rank"), None)
-        close_col = next((i + 1 for i, value in enumerate(headers) if "close" in value and "$" in value), 6)
-        earnings_cols = [i + 1 for i, value in enumerate(headers) if value == "earnings"]
+        # Headers were renamed to plain English ("Closing Price", "Earnings Dates");
+        # both spellings are matched so older workbooks still resolve.
+        close_col = next(
+            (
+                i + 1
+                for i, value in enumerate(headers)
+                if value == "closing price" or ("close" in value and "$" in value)
+            ),
+            6,
+        )
+        earnings_cols = [i + 1 for i, value in enumerate(headers) if value.startswith("earnings")]
         next_earnings_col = (earnings_cols[-1] + 1) if earnings_cols else ws.max_column
         run_dates = [
             parse_run_date_value(ws.cell(row=row_idx, column=date_col).value)

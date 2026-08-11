@@ -24,9 +24,13 @@ refreshes price data, screens tickers, simulates trades, and emails a summary.
    intraday when available else daily OHLC), applies a SPY-based market
    regime gate before allowing new simulated entries, and tracks upcoming
    IPOs (60d) / earnings (14d, via the public Nasdaq calendar API). Writes
-   `results.xlsx` (sheets: Single Tickers, Simulation, AM Simulation,
-   Investment Dashboard, Upcoming IPOs/Earnings, Top 10 OHLC Tracking, Daily
-   Runs, plus one dated sheet per run day).
+   `results.xlsx` (sheets: How It Works, Single Tickers, Simulation, AM
+   Simulation, Investment Dashboard, Upcoming IPOs/Earnings, Recent Splits
+   (90D), Top 10 OHLC Tracking, Daily Runs, plus one dated sheet per run day).
+   "How It Works" is a non-technical guide to the pipeline, rebuilt each run
+   from the live thresholds; adding a sheet means registering its name in
+   `PROTECTED_SHEET_NAMES` here *and* in `send_daily_email.py`, which
+   otherwise treats an unrecognized sheet as the ranked stock list.
 4. **Email report**: `send_daily_email.py` reads `results.xlsx` and emails a
    formatted summary via SMTP.
 

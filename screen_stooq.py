@@ -571,6 +571,7 @@ MARKET_REGIME_LONG_SMA_DAYS = 200
 MARKET_REGIME_MOMENTUM_DAYS = 5
 MARKET_REGIME_SPY_MIN_5D_RETURN = -0.02
 MARKET_REGIME_MODES = ("standard", "aggressive")
+HOW_IT_WORKS_SHEET_NAME = "How It Works"
 RECENT_SPLITS_SHEET_NAME = "Recent Splits (90D)"
 UPCOMING_IPOS_SHEET_NAME = "Upcoming IPOs (60D)"
 UPCOMING_EARNINGS_SHEET_NAME = "Upcoming Earnings (14D)"
@@ -585,6 +586,8 @@ TOP10_OHLC_HIDDEN_COLUMNS = ("F", "G", "H", "M", "P")
 TOP10_OHLC_TRAILING_HIDDEN_COLUMNS = ("R",)
 PROTECTED_SHEET_NAMES = {
     "Single Tickers",
+    HOW_IT_WORKS_SHEET_NAME,
+    RECENT_SPLITS_SHEET_NAME,
     UPCOMING_IPOS_SHEET_NAME,
     UPCOMING_EARNINGS_SHEET_NAME,
     TOP10_OHLC_SHEET_NAME,
@@ -710,68 +713,6 @@ def fetch_nasdaq_earnings_dates(
             "name": company_names.get(sym, ""),
         }
     return out
-
-
-def fetch_polygon_last_splits(
-    symbols: list[str],
-    api_key: str,
-    session: requests.Session,
-) -> dict[str, tuple[date, str]]:
-    """
-    Most recent split per symbol -> (execution_date, "from:to").
-
-    One request covers every symbol via ticker.any_of, because a per-symbol call
-    would blow the free tier's 5/min limit on a 25-row report. Returns {} when no
-    key is configured so the columns simply stay blank. Note that Polygon's Basic
-    plan only retains two years of splits, so older events read as "no split".
-    """
-    api_key = (api_key or "").strip()
-    wanted = [s for s in dict.fromkeys(sym.strip().upper() for sym in symbols) if s]
-    if not api_key or not wanted:
-        return {}
-
-    latest: dict[str, tuple[date, str]] = {}
-    params: dict[str, Any] = {
-        "ticker.any_of": ",".join(wanted),
-        "sort": "execution_date.desc",
-        "limit": 1000,
-        "apiKey": api_key,
-    }
-    url: str | None = POLYGON_SPLITS_URL
-
-    try:
-        while url:
-            resp = session.get(url, params=params, timeout=30)
-            resp.raise_for_status()
-            payload = resp.json()
-            for row in payload.get("results") or []:
-                symbol = str(row.get("ticker") or "").strip().upper()
-                if not symbol or symbol in latest:
-                    continue  # results are date-desc, so the first hit is newest
-                try:
-                    executed = datetime.strptime(
-                        str(row.get("execution_date")), "%Y-%m-%d"
-                    ).date()
-                except (TypeError, ValueError):
-                    continue
-                split_from = row.get("split_from")
-                split_to = row.get("split_to")
-                if split_from in (None, "") or split_to in (None, ""):
-                    ratio = ""
-                else:
-                    ratio = f"{_trim_split_leg(split_from)}:{_trim_split_leg(split_to)}"
-                latest[symbol] = (executed, ratio)
-
-            if len(latest) >= len(wanted):
-                break
-            url = payload.get("next_url") or None
-            # next_url carries the query forward; only the key must be re-sent.
-            params = {"apiKey": api_key}
-    except (requests.RequestException, ValueError) as exc:
-        print(f"Warning: could not fetch splits from Polygon ({exc}). Split columns left blank.")
-        return latest
-
-    return latest
 
 
 def fetch_polygon_splits_since(
@@ -907,6 +848,386 @@ def write_recent_splits_sheet(
         ws.cell(row=row_idx, column=2).number_format = "mmm d, yyyy"
 
     auto_size_columns(ws, min_width=10, max_width=45)
+
+
+def write_how_it_works_sheet(wb: Workbook, args: Any, avg_vol_mode: str) -> None:
+    """
+    Create or replace the plain-English guide tab.
+
+    Rewritten on every run so the thresholds quoted here are the ones the run
+    actually used; nothing else reads this sheet.
+    """
+    sheet_name = HOW_IT_WORKS_SHEET_NAME
+    if sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        for rng in list(ws.merged_cells.ranges):
+            ws.unmerge_cells(str(rng))
+        if ws.max_row > 0:
+            ws.delete_rows(1, ws.max_row)
+    else:
+        ws = wb.create_sheet(title=sheet_name)
+
+    beta_window = (
+        f"{args.beta_months} months" if args.beta_freq == "monthly" else f"{args.beta_lookback} days"
+    )
+    vol_window = (
+        f"{args.avg_vol_months} months" if avg_vol_mode == "months" else f"{args.avg_vol_days} days"
+    )
+    regime_rule = (
+        "the S&P 500 is above both its 50-day and 200-day average, its 20-day average is "
+        "above its 50-day average, and it rose over the last 5 days"
+        if args.market_regime_mode == "aggressive"
+        else "the S&P 500 is above its 50-day average and has not fallen more than 2% "
+        "over the last 5 days"
+    )
+
+    # (kind, label, text). "head" starts a section, "row" is a label/value pair,
+    # "text" is a full-width paragraph, "gap" is a blank spacer.
+    lines: list[tuple[str, str, str]] = [
+        ("title", "How This Spreadsheet Works", ""),
+        (
+            "text",
+            "",
+            "A program runs by itself every weekday evening. It looks at every NYSE stock we "
+            "track, keeps the handful that look like short-term momentum setups, ranks them, "
+            "and then plays out a pretend trade on each one. No real money is involved and "
+            "nothing here is a recommendation to buy or sell anything.",
+        ),
+        ("gap", "", ""),
+        ("head", "What happens each evening", ""),
+        (
+            "row",
+            "1. Get fresh prices",
+            "Download yesterday's and today's open, high, low, close and volume for every "
+            "tracked stock from Polygon.io, a market data provider.",
+        ),
+        (
+            "row",
+            "2. Screen",
+            "Throw out every stock that fails any of the tests in the next section. Whatever "
+            "survives is a candidate.",
+        ),
+        (
+            "row",
+            "3. Rank",
+            "Give each survivor a score out of 1 and sort them best-first. The top "
+            f"{args.daily_limit} go on the Daily Runs tab.",
+        ),
+        (
+            "row",
+            "4. Simulate",
+            f"Pretend to buy the top {args.top_n} the next morning and follow each one until "
+            "it wins, loses, or times out. Results land on the Simulation tabs.",
+        ),
+        (
+            "row",
+            "5. Email",
+            "Send a summary of all of the above.",
+        ),
+        ("gap", "", ""),
+        ("head", "Which stocks make the list", ""),
+        (
+            "text",
+            "",
+            "A stock has to pass all six tests on the same day. These are momentum tests: they "
+            "look for something already moving up, traded heavily enough to get in and out of, "
+            "and jumpy enough to move 2% in a few days.",
+        ),
+        (
+            "row",
+            "Enough trading",
+            f"At least ${args.avg_dollar_vol_min:,.0f} of the stock changes hands on an average "
+            f"day, measured over the last {vol_window}. Thin stocks are hard to sell.",
+        ),
+        (
+            "row",
+            "Moves more than the market",
+            f"Beta above {args.beta_min} over {beta_window}. Beta 1.0 means it moves with the "
+            "S&P 500; 1.5 means it swings about half again as hard.",
+        ),
+        (
+            "row",
+            "Rising, not overheated",
+            f"RSI between {args.rsi_low} and {args.rsi_high}. RSI runs 0-100 and measures "
+            "recent buying pressure. Under 50 is drifting; over 70 usually means the move is "
+            "already stretched.",
+        ),
+        (
+            "row",
+            "Swings enough to matter",
+            f"Average daily range above {args.atr_min_pct}% of the share price, measured over "
+            f"{args.atr_period} days. A stock that moves 0.5% a day will never reach a 2% target.",
+        ),
+        (
+            "row",
+            "Trend turning up",
+            "MACD above its signal line. MACD compares a "
+            f"{args.macd_fast}-day and a {args.macd_slow}-day average price; when the faster "
+            "one pulls ahead, the recent trend is stronger than the older one.",
+        ),
+        (
+            "row",
+            "Has real price history",
+            "Enough stored days to compute all of the above.",
+        ),
+        ("gap", "", ""),
+        ("head", "How the ranking works", ""),
+        (
+            "text",
+            "",
+            "Survivors first have to clear three extra safety checks, then get scored. A stock "
+            "is skipped entirely if earnings are due within 10 days (earnings move prices for "
+            "reasons this screener cannot see), if it trades under $10 million a day, if its "
+            "daily swing is under 2.5%, or if its RSI is 68 or higher.",
+        ),
+        (
+            "text",
+            "",
+            "Everything left gets a score from 0 to 1. Five things are graded and blended by "
+            "importance:",
+        ),
+        (
+            "row",
+            "Trading volume - 30%",
+            "How heavily traded it is compared with the other candidates that day. Most traded "
+            "scores 1, least traded scores 0.",
+        ),
+        (
+            "row",
+            "Daily swing - 25%",
+            "Full marks for a 3% to 5.5% average daily range. Calmer or wilder than that loses "
+            "points. Too calm never reaches the target; too wild trips the stop loss.",
+        ),
+        (
+            "row",
+            "RSI - 20%",
+            "Full marks at RSI 55, sliding to zero by 40 or 70. The middle of the range is "
+            "rising without being overbought.",
+        ),
+        (
+            "row",
+            "Momentum - 15%",
+            "All or nothing: full marks if the MACD trend improved over the last 5 days, zero "
+            "if it did not.",
+        ),
+        (
+            "row",
+            "Repeat showings - 10%",
+            "How many of the last 5 runs the stock also appeared in. Showing up 5 days straight "
+            "scores 1. A setup that keeps qualifying is steadier than a one-day blip.",
+        ),
+        (
+            "text",
+            "",
+            "The scores are sorted highest-first and that order becomes the Rank column. Rank 1 "
+            "is the best-scoring stock of that day, not a prediction.",
+        ),
+        ("gap", "", ""),
+        ("head", "How the pretend trades work", ""),
+        (
+            "row",
+            "Buy",
+            f"$10,000 of each of the top {args.top_n} ranked stocks, at the next morning's "
+            "opening price. Simulation uses the normal 9:30am open; AM Simulation uses the "
+            "earlier pre-market open, to compare the two.",
+        ),
+        (
+            "row",
+            "Sell",
+            "Whichever comes first: up 2% (a win), down 1% (a loss), or 5 trading days pass "
+            "(closed at whatever it is worth). Minute-by-minute prices decide the exact moment "
+            "when they are available.",
+        ),
+        (
+            "row",
+            "Market check",
+            f"No new pretend buys at all unless {regime_rule}. When the whole market is falling, "
+            "momentum setups tend to fail together, so those days are recorded as blocked "
+            "instead of traded.",
+        ),
+        (
+            "row",
+            "Same-day both",
+            "If a stock hit both +2% and -1% on the same day, the loss is assumed to have come "
+            "first. That keeps the results pessimistic rather than flattering.",
+        ),
+        ("gap", "", ""),
+        ("head", "What each tab holds", ""),
+        (
+            "row",
+            DAILY_RUNS_SHEET_NAME,
+            "One row per stock that made the cut, newest day on top, blank row between days. "
+            "Row 1 names each column and row 2 gives the setting behind it.",
+        ),
+        (
+            "row",
+            SUMMARY_SHEET_NAME,
+            "Every pretend trade opened at the normal market open, plus running totals of wins, "
+            "losses and profit.",
+        ),
+        (
+            "row",
+            AM_SIMULATION_SHEET_NAME,
+            "The same trades bought at the pre-market open instead, so the two entry times can "
+            "be compared.",
+        ),
+        (
+            "row",
+            UPCOMING_EARNINGS_SHEET_NAME,
+            "Earnings dates in the next 14 days, flagged if the stock recently qualified. "
+            "Earnings are the most common reason a setup breaks.",
+        ),
+        (
+            "row",
+            UPCOMING_IPOS_SHEET_NAME,
+            "New listings expected in the next 60 days. Informational only, they have no price "
+            "history to screen.",
+        ),
+        (
+            "row",
+            RECENT_SPLITS_SHEET_NAME,
+            "Stock splits in the last 90 days. A split changes the share price without changing "
+            "the company's value, so older stored prices for that stock are misleading until "
+            "they are rescaled.",
+        ),
+        ("gap", "", ""),
+        ("head", "Reading the Daily Runs columns", ""),
+        ("row", "Symbol / Company", "Ticker and shortened company name."),
+        ("row", "Rank", "Score position that day. 1 is the highest score."),
+        (
+            "row",
+            "Times Seen",
+            "How many of the previous 5 runs this stock also appeared in, from 0 to 5.",
+        ),
+        ("row", "Closing Price", "Last closing price, and how much it changed over 5 days."),
+        (
+            "row",
+            "52-Week High / 2-Year High",
+            "Highest close in the past year, and in all stored history (about 2 years), each "
+            "with how long ago that was. Far below either means room to recover; just under "
+            "means it is near the top of its range.",
+        ),
+        (
+            "row",
+            "Last 5% Higher Close",
+            "The most recent day it closed at least 5% above today's price. A recent date means "
+            "it has pulled back from that level; blank means today is close to the highest it "
+            "has been.",
+        ),
+        ("row", "Beta vs S&P 500", "How hard it swings compared with the market. Above 1 is jumpier."),
+        ("row", "RSI Momentum", "Buying pressure, 0-100. Roughly 50-70 is rising but not overbought."),
+        ("row", "ATR Daily Swing %", "How far it typically travels in a day, as a % of its price."),
+        (
+            "row",
+            "MACD Trend / Signal Line / MACD vs Signal",
+            "Trend strength, its smoothed version, and the gap between them. MACD above signal "
+            "means the recent trend is stronger than the older one; a widening gap means it is "
+            "still strengthening.",
+        ),
+        ("row", "Avg Daily $ Volume", f"Dollars traded on an average day over the last {vol_window}."),
+        ("row", "Earnings Dates", "Most recent and next scheduled earnings announcement."),
+        (
+            "row",
+            "High Since Split",
+            "Only filled in when the 2-Year High came before a split or spinoff. In that case "
+            "the old high refers to a share that no longer exists, and this is the highest "
+            "price since, which is the one worth comparing against.",
+        ),
+        (
+            "row",
+            "The % columns",
+            "The narrow unlabelled column to the right of most values shows how that number "
+            "changed over the last 5 days.",
+        ),
+        ("gap", "", ""),
+        ("head", "Worth knowing", ""),
+        (
+            "text",
+            "",
+            "None of these trades are real. There is no broker connection anywhere in this "
+            "project; the Simulation tabs are a record of what would have happened.",
+        ),
+        (
+            "text",
+            "",
+            "Stored price history only goes back about 2 years, so anything labelled an all-time "
+            "or 2-year figure only reaches as far as that.",
+        ),
+        (
+            "text",
+            "",
+            "The screen is tuned for short holds of a few days. It says nothing about whether a "
+            "company is worth owning - it never looks at earnings, debt, or what the business "
+            "does.",
+        ),
+        (
+            "text",
+            "",
+            "Every tab except this one and the Simulation history is rebuilt from scratch on "
+            "each run, so edits made by hand will be overwritten.",
+        ),
+    ]
+
+    black = Color(indexed=8)
+    white = Color(indexed=9)
+    title_font = Font(name="Calibri", size=16, bold=True, color=white)
+    head_font = Font(name="Calibri", size=13, bold=True, color=white)
+    label_font = Font(name="Calibri", size=11, bold=True, color=black)
+    body_font = Font(name="Calibri", size=11, color=black)
+    fill_black = PatternFill(fill_type="solid", fgColor=black)
+    wrap_top = Alignment(horizontal="left", vertical="top", wrap_text=True)
+    left_center = Alignment(horizontal="left", vertical="center")
+
+    label_width = 30
+    body_width = 100
+    ws.column_dimensions["A"].width = label_width
+    ws.column_dimensions["B"].width = body_width
+
+    def wrapped_height(text: str, width: int) -> float:
+        # Excel does not auto-fit wrapped rows, so estimate the line count from
+        # the column width and set the height explicitly. The usable width is
+        # shaved a little because a proportional font fits a variable number of
+        # characters, and under-estimating the line count clips the text.
+        usable = max(10, width - 3)
+        lines_used = 0
+        for paragraph in text.split("\n"):
+            lines_used += max(1, -(-len(paragraph) // usable))
+        return max(15.0, lines_used * 15.0 + 3.0)
+
+    for kind, label, text in lines:
+        row_idx = ws.max_row + 1 if ws.max_row > 1 or ws["A1"].value is not None else 1
+        if kind == "gap":
+            ws.cell(row=row_idx, column=1, value=None)
+            ws.row_dimensions[row_idx].height = 8.0
+            continue
+        if kind in ("title", "head"):
+            cell = ws.cell(row=row_idx, column=1, value=label)
+            cell.font = title_font if kind == "title" else head_font
+            cell.alignment = left_center
+            for col_idx in (1, 2):
+                ws.cell(row=row_idx, column=col_idx).fill = fill_black
+            ws.merge_cells(start_row=row_idx, start_column=1, end_row=row_idx, end_column=2)
+            ws.row_dimensions[row_idx].height = 28.0 if kind == "title" else 22.0
+            continue
+        if kind == "row":
+            label_cell = ws.cell(row=row_idx, column=1, value=label)
+            label_cell.font = label_font
+            label_cell.alignment = wrap_top
+            body_cell = ws.cell(row=row_idx, column=2, value=text)
+            body_cell.font = body_font
+            body_cell.alignment = wrap_top
+            ws.row_dimensions[row_idx].height = max(
+                wrapped_height(text, body_width), wrapped_height(label, label_width)
+            )
+            continue
+        # Full-width paragraph.
+        cell = ws.cell(row=row_idx, column=1, value=text)
+        cell.font = body_font
+        cell.alignment = wrap_top
+        ws.merge_cells(start_row=row_idx, start_column=1, end_row=row_idx, end_column=2)
+        ws.row_dimensions[row_idx].height = wrapped_height(text, label_width + body_width)
+
+    ws.sheet_view.showGridLines = False
 
 
 def _trim_split_leg(value: Any) -> str:
@@ -3662,36 +3983,36 @@ def main() -> None:
     if out_path.suffix.lower() != ".xlsx":
         out_path = out_path.with_suffix(".xlsx")
 
+    # Row 1 spells out what each number means in plain words; row 2 (descriptors,
+    # below) carries the settings behind it. The "How It Works" tab explains both.
     header_row = [
         "Symbol",
         "Company",
-        "Prev 5x",
-        " Close $",
+        "Times Seen",
+        "Closing Price",
         None,
-        "52W High",
+        "52-Week High",
         None,
-        "2Y High",
+        "2-Year High",
         None,
         "Last 5% Higher Close",
         None,
-        "Beta",
+        "Beta vs S&P 500",
         None,
-        "RSI",
+        "RSI Momentum",
         None,
-        "ATR %",
-        "MACD",
+        "ATR Daily Swing %",
+        "MACD Trend",
         None,
-        "Signal",
+        "MACD Signal Line",
         None,
-        "MACD/Signal",
+        "MACD vs Signal",
         None,
-        "Avg $ Vol",
+        "Avg Daily $ Volume",
         None,
-        "Earnings",
+        "Earnings Dates",
         None,
-        "Post-Gap High",
-        "Last Split",
-        None,
+        "High Since Split",
     ]
     data_keys = [
         "symbol",
@@ -3721,8 +4042,6 @@ def main() -> None:
         "last_earnings_date",
         "next_earnings_date",
         "high_post_gap_close",
-        "last_split_date",
-        "last_split_ratio",
     ]
     if args.score_enable:
         header_row = header_row[:2] + ["Rank"] + header_row[2:]
@@ -3775,19 +4094,7 @@ def main() -> None:
             key=lambda r: str(r.get("symbol", "")).strip().upper(),
         )[: args.daily_limit]
 
-    # Only the rows that reach a sheet need split data, so this stays one small
-    # request regardless of universe size.
     splits_session = requests.Session()
-    reported_rows = results[:1] if run_mode == "single" else daily_output_rows
-    last_splits = fetch_polygon_last_splits(
-        [str(row.get("symbol", "")) for row in reported_rows],
-        args.polygon_api_key,
-        splits_session,
-    )
-    for row in reported_rows:
-        split = last_splits.get(str(row.get("symbol", "")).strip().upper())
-        if split is not None:
-            row["last_split_date"], row["last_split_ratio"] = split
 
     # Universe-wide sweep: a split corrupts a symbol's stored history whether or
     # not that symbol ranked today, so this is not limited to reported rows.
@@ -3837,22 +4144,22 @@ def main() -> None:
         avg_desc = f"{avg_vol_days} days\n> ${args.avg_dollar_vol_min:,.0f}"
 
     pct_change_days = 5
-    pct_change_desc = f"{pct_change_days} days \nchange %"
-    pct_desc = f"{pct_change_days} days %"
+    pct_change_desc = f"vs {pct_change_days}\ndays ago"
+    pct_desc = f"vs {pct_change_days} days ago"
     beta_change_desc = (
-        f"{pct_change_days} months \nchange %" if args.beta_freq == "monthly" else pct_change_desc
+        f"vs {pct_change_days}\nmonths ago" if args.beta_freq == "monthly" else pct_change_desc
     )
     descriptors = [
         None,
         None,
-        "Last 5 runs",
-        None,
+        "of the last\n5 runs",
+        "Latest close",
         pct_change_desc,
-        None,
+        "Best close\nin 1 year",
         "Days ago",
-        None,
+        "Best close\nin the data",
         "Days ago",
-        None,
+        "Date",
         "Days ago",
         beta_desc,
         beta_change_desc,
@@ -3867,11 +4174,9 @@ def main() -> None:
         pct_desc,
         avg_desc,
         pct_desc,
-        "Last",
+        "Most recent",
         "Next",
-        f"High since last\n>{PRICE_BASIS_GAP_RATIO:g}x price gap",
-        "Date",
-        "From:To",
+        f"After last\n{PRICE_BASIS_GAP_RATIO:g}x price jump",
     ]
     if args.score_enable:
         descriptors = descriptors[:2] + [None] + descriptors[2:]
@@ -3949,8 +4254,6 @@ def main() -> None:
                 parse_mmddyyyy(row.get("last_earnings_date")),
                 parse_mmddyyyy(row.get("next_earnings_date")),
                 to_float(row.get("high_post_gap_close")),
-                parse_mmddyyyy(row.get("last_split_date")),
-                row.get("last_split_ratio") or None,
             ]
         )
         return output_row
@@ -3970,6 +4273,7 @@ def main() -> None:
         earnings_end = earnings_start + timedelta(days=14)
         earnings_rows = fetch_nasdaq_upcoming_earnings(session, earnings_start, earnings_end)
         write_upcoming_earnings_sheet(wb, earnings_rows, earnings_start, earnings_end, qualified_dates)
+        write_how_it_works_sheet(wb, args, avg_vol_mode)
         auto_size_columns(ws)
         wb.save(out_path)
         print(f"Wrote single ticker to {out_path} (Single Tickers)")
@@ -4022,7 +4326,8 @@ def main() -> None:
     symbol_font = Font(name="Calibri", size=13, bold=True, color=white)
     bold_font = Font(name="Calibri", size=11, bold=True, color=black)
 
-    header_align = Alignment(horizontal="center", vertical="center")
+    # Headers wrap so the spelled-out names fit their existing column widths.
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
     descriptor_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
     left_center_align = Alignment(horizontal="left", vertical="center")
     center_bottom_align = Alignment(horizontal="center", vertical="bottom")
@@ -4040,21 +4345,21 @@ def main() -> None:
     def shift_cols(cols: set[int]) -> set[int]:
         return {shift_col_idx(col) for col in cols}
 
-    header_style_cols = shift_cols({1, 2, 3, 4, 6, 8, 10, 12, 14, 16, 17, 19, 21, 23, 25})
-    header_value_cols = shift_cols({2, 3, 4, 6, 8, 10, 12, 14, 16, 17, 19, 21, 23, 25})
+    header_style_cols = shift_cols({1, 2, 3, 4, 6, 8, 10, 12, 14, 16, 17, 19, 21, 23, 25, 27})
+    header_value_cols = shift_cols({2, 3, 4, 6, 8, 10, 12, 14, 16, 17, 19, 21, 23, 25, 27})
     header_style_cols.add(1)
     if args.score_enable:
         header_style_cols.update({4})
         header_value_cols.update({4})
-    left_thick_cols = shift_cols({4, 6, 8, 10, 12, 14, 16, 17, 19, 21, 23, 25})
-    right_thick_cols = shift_cols({5, 7, 9, 11, 13, 15, 16, 18, 20, 22, 24, 26})
-    header_right_cols = {shift_col_idx(25), shift_col_idx(26)}
+    left_thick_cols = shift_cols({4, 6, 8, 10, 12, 14, 16, 17, 19, 21, 23, 25, 27})
+    right_thick_cols = shift_cols({5, 7, 9, 11, 13, 15, 16, 18, 20, 22, 24, 26, 27})
+    header_right_cols = {shift_col_idx(25), shift_col_idx(26), shift_col_idx(27)}
 
     # Column widths from the sample spreadsheet
     base_column_widths = {
         1: 8.0,
         2: 12.0,
-        3: 8.0,
+        3: 11.0,
         4: 9.0,
         5: 12.0,
         6: 13.5,
@@ -4078,6 +4383,7 @@ def main() -> None:
         24: 12.5312,
         25: 14.2734,
         26: 13.0,
+        27: 14.0,
     }
     column_widths = (
         {shift_col_idx(k): v for k, v in base_column_widths.items()}
@@ -4089,7 +4395,7 @@ def main() -> None:
         ws.column_dimensions[get_column_letter(col_idx)].width = width
 
     ws.row_dimensions[1].height = 50.85
-    ws.row_dimensions[2].height = 34.85
+    ws.row_dimensions[2].height = 40.0
     for row_idx in range(3, ws.max_row + 1):
         ws.row_dimensions[row_idx].height = 17.0
 
@@ -4152,6 +4458,7 @@ def main() -> None:
         24: pct_literal_format,
         25: "mmm d, yyyy",
         26: "mmm d, yyyy",
+        27: '"$"#,##0.00',
     }
     number_formats = (
         {shift_col_idx(k): v for k, v in base_number_formats.items()}
@@ -4248,6 +4555,7 @@ def main() -> None:
         intraday_exit_source=args.intraday_exit_source,
         market_regime_mode=args.market_regime_mode,
     )
+    write_how_it_works_sheet(wb, args, avg_vol_mode)
     prune_old_run_sheets(wb, keep_runs=15)
 
     wb.save(out_path)
