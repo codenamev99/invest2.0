@@ -63,7 +63,7 @@ better than -2%).
 
 ## Automation
 
-`.github/workflows/daily-screener.yml` runs on cron `0 18 * * 1-5` (6pm
+`.github/workflows/daily-screener.yml` runs on cron `30 16 * * 1-5` (4:30pm
 America/New_York, weekdays): checkout → Python 3.12 setup → install deps →
 restore `data 2` cache → run `run_daily.sh` → email results → commit the
 updated `results.xlsx` back to the repo as `github-actions[bot]`.

@@ -5,8 +5,8 @@ env:
 
 on:
   schedule:
-    # 6:00 PM Eastern time, Monday–Friday.
-    - cron: "0 18 * * 1-5"
+    # 4:30 PM Eastern time, Monday–Friday.
+    - cron: "30 16 * * 1-5"
       timezone: "America/New_York"
   workflow_dispatch:
 
