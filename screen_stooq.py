@@ -1139,13 +1139,6 @@ def write_how_it_works_sheet(wb: Workbook, args: Any, avg_vol_mode: str) -> None
         ("row", "Earnings Dates", "Most recent and next scheduled earnings announcement."),
         (
             "row",
-            "High Since Split",
-            "Only filled in when the 2-Year High came before a split or spinoff. In that case "
-            "the old high refers to a share that no longer exists, and this is the highest "
-            "price since, which is the one worth comparing against.",
-        ),
-        (
-            "row",
             "The % columns",
             "The narrow unlabelled column to the right of most values shows how that number "
             "changed over the last 5 days.",
@@ -3527,13 +3520,11 @@ def screen_symbol(
     high_52, high_52_days = max_value_and_days_ago(d, h, last_date, cutoff_52_int)
     # Full-file scan: d/h only cover the tail window, which is roughly one year.
     history_high = scan_all_time_high(path)
-    post_gap_high = None
     if history_high is None:
         high_all, high_all_days = max_value_and_days_ago(d, h, last_date, None)
     else:
         high_all = history_high.high
         high_all_days = (last_date - date_from_int(history_high.date_int)).days
-        post_gap_high = history_high.post_gap_high
     last_5pct_date, last_5pct_days = last_close_5pct_higher_info(d, c, last_close, last_date)
 
     # RSI filter
@@ -3647,7 +3638,6 @@ def screen_symbol(
         "high_52w_days_ago": high_52_days,
         "high_all_close": high_all,
         "high_all_days_ago": high_all_days,
-        "high_post_gap_close": post_gap_high,
         "last_5pct_higher_date": last_5pct_date,
         "last_5pct_higher_days_ago": last_5pct_days,
         "beta": b,
@@ -4122,7 +4112,6 @@ def main() -> None:
         None,
         "Earnings Dates",
         None,
-        "High Since Split",
     ]
     data_keys = [
         "symbol",
@@ -4151,7 +4140,6 @@ def main() -> None:
         "avg_dollar_volume_pct_5",
         "last_earnings_date",
         "next_earnings_date",
-        "high_post_gap_close",
     ]
     if args.score_enable:
         header_row = header_row[:2] + ["Rank"] + header_row[2:]
@@ -4286,7 +4274,6 @@ def main() -> None:
         pct_desc,
         "Most recent",
         "Next",
-        f"After last\n{PRICE_BASIS_GAP_RATIO:g}x price jump",
     ]
     if args.score_enable:
         descriptors = descriptors[:2] + [None] + descriptors[2:]
@@ -4363,7 +4350,6 @@ def main() -> None:
                 fmt_pct_value(row.get("avg_dollar_volume_pct_5")),
                 parse_mmddyyyy(row.get("last_earnings_date")),
                 parse_mmddyyyy(row.get("next_earnings_date")),
-                to_float(row.get("high_post_gap_close")),
             ]
         )
         return output_row
@@ -4455,15 +4441,15 @@ def main() -> None:
     def shift_cols(cols: set[int]) -> set[int]:
         return {shift_col_idx(col) for col in cols}
 
-    header_style_cols = shift_cols({1, 2, 3, 4, 6, 8, 10, 12, 14, 16, 17, 19, 21, 23, 25, 27})
-    header_value_cols = shift_cols({2, 3, 4, 6, 8, 10, 12, 14, 16, 17, 19, 21, 23, 25, 27})
+    header_style_cols = shift_cols({1, 2, 3, 4, 6, 8, 10, 12, 14, 16, 17, 19, 21, 23, 25})
+    header_value_cols = shift_cols({2, 3, 4, 6, 8, 10, 12, 14, 16, 17, 19, 21, 23, 25})
     header_style_cols.add(1)
     if args.score_enable:
         header_style_cols.update({4})
         header_value_cols.update({4})
-    left_thick_cols = shift_cols({4, 6, 8, 10, 12, 14, 16, 17, 19, 21, 23, 25, 27})
-    right_thick_cols = shift_cols({5, 7, 9, 11, 13, 15, 16, 18, 20, 22, 24, 26, 27})
-    header_right_cols = {shift_col_idx(25), shift_col_idx(26), shift_col_idx(27)}
+    left_thick_cols = shift_cols({4, 6, 8, 10, 12, 14, 16, 17, 19, 21, 23, 25})
+    right_thick_cols = shift_cols({5, 7, 9, 11, 13, 15, 16, 18, 20, 22, 24, 26})
+    header_right_cols = {shift_col_idx(25), shift_col_idx(26)}
 
     # Column widths from the sample spreadsheet
     base_column_widths = {
@@ -4493,7 +4479,6 @@ def main() -> None:
         24: 12.5312,
         25: 14.2734,
         26: 13.0,
-        27: 14.0,
     }
     column_widths = (
         {shift_col_idx(k): v for k, v in base_column_widths.items()}
@@ -4568,7 +4553,6 @@ def main() -> None:
         24: pct_literal_format,
         25: "mmm d, yyyy",
         26: "mmm d, yyyy",
-        27: '"$"#,##0.00',
     }
     number_formats = (
         {shift_col_idx(k): v for k, v in base_number_formats.items()}

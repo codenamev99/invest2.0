@@ -3,11 +3,7 @@ Recompute the historical high columns in an existing results.xlsx.
 
 Rows written before the full-file high scan landed hold a high taken from a
 ~1-year tail window, so they duplicate the 52-week high. This rewalks every
-Daily Runs row, recomputing its high as of that row's own run date, and fills
-in the Post-Gap High warning column where one applies.
-
-Split columns are deliberately left alone: they describe current corporate
-actions, not the state of the world on an old run date.
+Daily Runs row, recomputing its high as of that row's own run date.
 
     python backfill_high_columns.py --workbook results.xlsx --root "data 2/daily/us" --dry-run
 """
@@ -26,16 +22,15 @@ import screen_stooq as ss
 
 
 HIGH_HEADERS = {"2y high", "all-time high"}
-POST_GAP_HEADER = "post-gap high"
 DAILY_RUNS_SHEET = "Daily Runs"
 
 
-def find_columns(ws) -> tuple[int, int, int, int | None]:
+def find_columns(ws) -> tuple[int, int, int]:
     """
-    Locate (symbol_col, high_col, high_days_col, post_gap_col) by header text.
+    Locate (symbol_col, high_col, high_days_col) by header text.
 
     Header lookup rather than fixed offsets, because this has to run against
-    workbooks written both before and after the new columns were added.
+    workbooks written both before and after the high columns were renamed.
     """
     headers = [str(c.value or "").strip().lower() for c in ws[1]]
 
@@ -48,27 +43,16 @@ def find_columns(ws) -> tuple[int, int, int, int | None]:
     if high_col is None:
         raise SystemExit("Could not find a '2Y High' or 'All-Time High' column.")
 
-    post_gap_col = next((i + 1 for i, h in enumerate(headers) if h == POST_GAP_HEADER), None)
     # The days-ago cell is the unlabelled column immediately right of the high.
-    return symbol_col, high_col, high_col + 1, post_gap_col
+    return symbol_col, high_col, high_col + 1
 
 
-def upgrade_headers(ws, high_col: int) -> int:
+def upgrade_headers(ws, high_col: int) -> None:
     """
-    Bring a pre-existing sheet up to the current column layout and return the
-    Post-Gap High column index.
-
-    Workbooks written before this column existed end at the Earnings pair, so it
-    appends in the same position the screener now writes, keeping later runs
-    consistent with what this backfill produces.
+    Bring a pre-existing sheet up to the current high-column naming.
     """
     if str(ws.cell(row=1, column=high_col).value or "").strip().lower() == "all-time high":
         ws.cell(row=1, column=high_col, value="2Y High")
-
-    post_gap_col = ws.max_column + 1
-    ws.cell(row=1, column=post_gap_col, value="Post-Gap High")
-    ws.cell(row=2, column=post_gap_col, value=f"High since last\n>{ss.PRICE_BASIS_GAP_RATIO:g}x price gap")
-    return post_gap_col
 
 
 def coerce_date(value: Any) -> date | None:
@@ -97,13 +81,9 @@ def main() -> None:
         raise SystemExit(f"No '{DAILY_RUNS_SHEET}' sheet in {workbook_path}")
     ws = wb[DAILY_RUNS_SHEET]
 
-    symbol_col, high_col, high_days_col, post_gap_col = find_columns(ws)
-    if post_gap_col is None:
-        if args.dry_run:
-            print("Note: sheet predates the new columns; a real run would add them.")
-        else:
-            post_gap_col = upgrade_headers(ws, high_col)
-            print("Upgraded sheet to the current column layout.")
+    symbol_col, high_col, high_days_col = find_columns(ws)
+    if not args.dry_run:
+        upgrade_headers(ws, high_col)
 
     file_map = ss.build_file_map(root)
     scan_cache: dict[tuple[str, int], Any] = {}
@@ -112,7 +92,6 @@ def main() -> None:
     unchanged = 0
     skipped_no_file = 0
     skipped_no_date = 0
-    flagged = 0
     examples: list[str] = []
 
     for row_idx in range(3, ws.max_row + 1):
@@ -157,24 +136,14 @@ def main() -> None:
         else:
             unchanged += 1
 
-        if result.post_gap_high is not None:
-            flagged += 1
-
         if not args.dry_run:
             ws.cell(row=row_idx, column=high_col, value=new_high)
             ws.cell(row=row_idx, column=high_days_col, value=new_days)
-            if post_gap_col is not None:
-                ws.cell(
-                    row=row_idx,
-                    column=post_gap_col,
-                    value=round(result.post_gap_high, 4) if result.post_gap_high is not None else None,
-                )
 
     ss.AS_OF_DATE_INT = None
 
     print(f"Rows corrected:        {changed}")
     print(f"Rows already correct:  {unchanged}")
-    print(f"Rows flagged post-gap: {flagged}")
     if skipped_no_file:
         print(f"Skipped, no price file:{skipped_no_file:>4}")
     if skipped_no_date:
