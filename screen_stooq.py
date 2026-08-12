@@ -1855,8 +1855,15 @@ def collect_top_ranked_cohorts(wb: Workbook, top_n: int = 10) -> list[dict[str, 
             rank_idx = headers.index("rank")
         except ValueError:
             continue
+        # "Closing Price" is the current header; the "close $" form is what older
+        # workbooks carry, and both have to resolve or the cohort is dropped and
+        # the simulation sheets rebuild empty.
         close_idx = next(
-            (idx for idx, header in enumerate(headers) if "close" in header and "$" in header),
+            (
+                idx
+                for idx, header in enumerate(headers)
+                if header == "closing price" or ("close" in header and "$" in header)
+            ),
             None,
         )
         if close_idx is None:
