@@ -18,6 +18,7 @@ UPCOMING_IPOS_SHEET_NAME = "Upcoming IPOs (60D)"
 UPCOMING_EARNINGS_SHEET_NAME = "Upcoming Earnings (14D)"
 SIMULATION_SHEET_NAME = "Simulation"
 AM_SIMULATION_SHEET_NAME = "AM Simulation"
+PM_SIMULATION_SHEET_NAME = "PM Simulation"
 LEGACY_SIMULATION_SHEET_NAME = "Summary"
 DAILY_RUNS_SHEET_NAME = "Daily Runs"
 PROTECTED_SHEETS = {
@@ -29,6 +30,7 @@ PROTECTED_SHEETS = {
     "Top 10 OHLC Tracking",
     SIMULATION_SHEET_NAME,
     AM_SIMULATION_SHEET_NAME,
+    PM_SIMULATION_SHEET_NAME,
     LEGACY_SIMULATION_SHEET_NAME,
     "Investment Dashboard",
     DAILY_RUNS_SHEET_NAME,
@@ -308,7 +310,12 @@ def simulation_totals_html(wb) -> str:
         (AM_SIMULATION_SHEET_NAME,),
         "AM Simulated Portfolio",
     )
-    return regular_totals + am_totals
+    pm_totals = simulation_sheet_totals_html(
+        wb,
+        (PM_SIMULATION_SHEET_NAME,),
+        "PM Simulated Portfolio",
+    )
+    return regular_totals + am_totals + pm_totals
 
 
 def build_email_html() -> tuple[str, str]:

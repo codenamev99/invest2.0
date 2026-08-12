@@ -25,8 +25,15 @@ refreshes price data, screens tickers, simulates trades, and emails a summary.
    regime gate before allowing new simulated entries, and tracks upcoming
    IPOs (60d) / earnings (14d, via the public Nasdaq calendar API). Writes
    `results.xlsx` (sheets: How It Works, Single Tickers, Simulation, AM
-   Simulation, Investment Dashboard, Upcoming IPOs/Earnings, Recent Splits
-   (90D), Top 10 OHLC Tracking, Daily Runs, plus one dated sheet per run day).
+   Simulation, PM Simulation, Investment Dashboard, Upcoming IPOs/Earnings,
+   Recent Splits (90D), Top 10 OHLC Tracking, Daily Runs, plus one dated sheet
+   per run day). The three simulation sheets share one engine
+   (`build_investment_simulation_rows`, switched by `entry_session`) and differ
+   only in entry fill: `regular` takes the next session's 9:30am open, `am` the
+   next morning's 4:00-9:29am pre-market open, `pm` the rank date's own
+   4:00-8:00pm after-hours open. A `pm` entry lands on the rank date itself, so
+   its exit scan starts the following trading day — that day's own high/low
+   preceded the fill and would otherwise fabricate exits.
    "How It Works" is a non-technical guide to the pipeline, rebuilt each run
    from the live thresholds; adding a sheet means registering its name in
    `PROTECTED_SHEET_NAMES` here *and* in `send_daily_email.py`, which

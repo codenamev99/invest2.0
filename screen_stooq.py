@@ -579,6 +579,7 @@ TOP10_OHLC_SHEET_NAME = "Top 10 OHLC Tracking"
 INVESTMENT_DASHBOARD_SHEET_NAME = "Investment Dashboard"
 SUMMARY_SHEET_NAME = "Simulation"
 AM_SIMULATION_SHEET_NAME = "AM Simulation"
+PM_SIMULATION_SHEET_NAME = "PM Simulation"
 SIMULATION_START_DATE = date(2026, 6, 12)
 LEGACY_SUMMARY_SHEET_NAME = "Summary"
 DAILY_RUNS_SHEET_NAME = "Daily Runs"
@@ -594,6 +595,7 @@ PROTECTED_SHEET_NAMES = {
     INVESTMENT_DASHBOARD_SHEET_NAME,
     SUMMARY_SHEET_NAME,
     AM_SIMULATION_SHEET_NAME,
+    PM_SIMULATION_SHEET_NAME,
     LEGACY_SUMMARY_SHEET_NAME,
     DAILY_RUNS_SHEET_NAME,
 }
@@ -1027,9 +1029,11 @@ def write_how_it_works_sheet(wb: Workbook, args: Any, avg_vol_mode: str) -> None
         (
             "row",
             "Buy",
-            f"$10,000 of each of the top {args.top_n} ranked stocks, at the next morning's "
-            "opening price. Simulation uses the normal 9:30am open; AM Simulation uses the "
-            "earlier pre-market open, to compare the two.",
+            f"$10,000 of each of the top {args.top_n} ranked stocks. Three entry times are "
+            "compared: Simulation buys at the next morning's normal 9:30am open, AM Simulation "
+            "at the earlier pre-market open that same morning, and PM Simulation on the "
+            "evening of the ranking day itself, in after-hours trading right after the 4pm "
+            "close.",
         ),
         (
             "row",
@@ -1068,8 +1072,15 @@ def write_how_it_works_sheet(wb: Workbook, args: Any, avg_vol_mode: str) -> None
         (
             "row",
             AM_SIMULATION_SHEET_NAME,
-            "The same trades bought at the pre-market open instead, so the two entry times can "
+            "The same trades bought at the pre-market open instead, so the entry times can "
             "be compared.",
+        ),
+        (
+            "row",
+            PM_SIMULATION_SHEET_NAME,
+            "The same trades bought the evening of the ranking day, in after-hours trading "
+            "just after the 4pm close, rather than waiting for the next morning. The five-day "
+            "clock still starts the following trading day.",
         ),
         (
             "row",
@@ -2358,13 +2369,15 @@ def build_investment_simulation_rows(
                 if ts_et.weekday() >= 5:
                     continue
                 # Polygon timestamps identify the start of each minute. AM extended
-                # hours are 4:00-9:29 a.m. ET; regular hours are 9:30 a.m.-4:00 p.m. ET.
+                # hours are 4:00-9:29 a.m. ET; regular hours are 9:30 a.m.-4:00 p.m. ET;
+                # PM extended hours are 4:00-8:00 p.m. ET.
                 minute_of_day = ts_et.hour * 60 + ts_et.minute
-                in_requested_session = (
-                    4 * 60 <= minute_of_day < 9 * 60 + 30
-                    if session == "am"
-                    else 9 * 60 + 30 <= minute_of_day < 16 * 60
-                )
+                if session == "am":
+                    in_requested_session = 4 * 60 <= minute_of_day < 9 * 60 + 30
+                elif session == "pm":
+                    in_requested_session = 16 * 60 <= minute_of_day < 20 * 60
+                else:
+                    in_requested_session = 9 * 60 + 30 <= minute_of_day < 16 * 60
                 if not in_requested_session:
                     continue
                 try:
@@ -2395,6 +2408,7 @@ def build_investment_simulation_rows(
         start_idx: int,
         target_price: float,
         stop_price: float,
+        entry_dt: datetime | None = None,
     ) -> tuple[float | None, datetime | None, str, str]:
         if intraday_exit_source == "daily" or not polygon_api_key:
             return None, None, "", ""
@@ -2403,17 +2417,38 @@ def build_investment_simulation_rows(
         if end_idx <= start_idx:
             return None, None, "", ""
         end_date = date_from_int(int(daily_dates[end_idx - 1]))
-        bars = fetch_polygon_minute_bars(symbol, entry_date, end_date)
-        if entry_session == "am":
-            # An AM entry can fill hours before the regular-hours bars fetched
-            # above begin; without the entry day's AM bars too, a target/stop
-            # crossing between the AM fill and the 9:30 open is never seen.
-            am_bars = fetch_polygon_minute_bars(symbol, entry_date, entry_date, session="am")
-            bars = am_bars + bars
+
+        if entry_session == "pm":
+            # A PM entry fills in the rank date's after-hours session, so start_idx
+            # already points at the next trading day. That evening's bars from the
+            # fill minute onward are scanned first, and the rank date's regular
+            # session -- which ran entirely before the fill -- is never fetched.
+            scan_start_date = date_from_int(int(daily_dates[start_idx]))
+            pm_bars = [
+                bar
+                for bar in fetch_polygon_minute_bars(symbol, entry_date, entry_date, session="pm")
+                if entry_dt is None or bar["datetime"] >= entry_dt
+            ]
+            bars = pm_bars + fetch_polygon_minute_bars(symbol, scan_start_date, end_date)
+            # The rank date's evening is part of the entry day, not one of the five
+            # follow days, so it must not count toward the timeout.
+            follow_dates = {bar["date"] for bar in bars if bar["date"] > entry_date}
+        else:
+            bars = fetch_polygon_minute_bars(symbol, entry_date, end_date)
+            if entry_session == "am":
+                # An AM entry can fill hours before the regular-hours bars fetched
+                # above begin; without the entry day's AM bars too, a target/stop
+                # crossing between the AM fill and the 9:30 open is never seen.
+                am_bars = fetch_polygon_minute_bars(symbol, entry_date, entry_date, session="am")
+                bars = am_bars + bars
+            follow_dates = {bar["date"] for bar in bars}
         if not bars:
             return None, None, "", ""
 
-        first_bar = next((bar for bar in bars if bar["date"] >= entry_date), None)
+        if entry_session == "pm":
+            first_bar = bars[0]
+        else:
+            first_bar = next((bar for bar in bars if bar["date"] >= entry_date), None)
         if first_bar is None:
             return None, None, "", ""
 
@@ -2430,7 +2465,7 @@ def build_investment_simulation_rows(
             if hit_target:
                 return target_price, bar_dt, "+2% target", "Polygon 1-min"
 
-        if len({bar["date"] for bar in bars}) >= follow_days:
+        if len(follow_dates) >= follow_days:
             final_bar = bars[-1]
             return float(final_bar["close"]), final_bar["datetime"], "Max 5 trading days", "Polygon 1-min"
 
@@ -2472,18 +2507,24 @@ def build_investment_simulation_rows(
         normalized = normalize_symbol(symbol)
         rank_date = cohort["rank_date"]
         market_regime = (market_regimes or {}).get(rank_date, {})
-        next_market_idx = int(np.searchsorted(market_dates, date_to_int(rank_date), side="right"))
-        if next_market_idx >= len(market_dates):
-            append_ignored_row(
-                cohort,
-                symbol,
-                None,
-                "Ignored: next trading day is not available yet.",
-                market_regime,
-            )
-            continue
-        required_entry_date_int = int(market_dates[next_market_idx])
-        required_entry_date = date_from_int(required_entry_date_int)
+        if entry_session == "pm":
+            # A PM entry fills in the rank date's own after-hours session, so unlike
+            # the other sessions it never waits for the next trading day.
+            required_entry_date_int = date_to_int(rank_date)
+            required_entry_date = rank_date
+        else:
+            next_market_idx = int(np.searchsorted(market_dates, date_to_int(rank_date), side="right"))
+            if next_market_idx >= len(market_dates):
+                append_ignored_row(
+                    cohort,
+                    symbol,
+                    None,
+                    "Ignored: next trading day is not available yet.",
+                    market_regime,
+                )
+                continue
+            required_entry_date_int = int(market_dates[next_market_idx])
+            required_entry_date = date_from_int(required_entry_date_int)
 
         path = symbol_paths.get(normalized)
         if path is None:
@@ -2512,7 +2553,13 @@ def build_investment_simulation_rows(
             continue
 
         entry_allowed = bool(market_regime.get("entry_allowed", True))
-        start_idx = int(np.searchsorted(dates, date_to_int(rank_date), side="right"))
+        start_idx = int(
+            np.searchsorted(
+                dates,
+                date_to_int(rank_date),
+                side="left" if entry_session == "pm" else "right",
+            )
+        )
         if start_idx >= len(dates) or int(dates[start_idx]) != required_entry_date_int:
             append_ignored_row(
                 cohort,
@@ -2528,7 +2575,28 @@ def build_investment_simulation_rows(
         entry_time = "Market Open"
         data_source = "Daily OHLC"
         entry_fallback_reason = ""
-        if entry_session == "am":
+        entry_dt: datetime | None = None
+        if entry_session == "pm":
+            pm_bars = (
+                fetch_polygon_minute_bars(symbol, entry_date, entry_date, session="pm")
+                if polygon_api_key
+                else []
+            )
+            first_pm_bar = next((bar for bar in pm_bars if bar["date"] == entry_date), None)
+            if first_pm_bar is None:
+                entry_price = float(closes[start_idx])
+                entry_time = "Market Close"
+                data_source = "Daily close PM fallback"
+                entry_fallback_reason = (
+                    "Good - PM extended-hours data unavailable; used the rank date's "
+                    "closing price."
+                )
+            else:
+                entry_price = float(first_pm_bar["open"])
+                entry_dt = first_pm_bar["datetime"]
+                entry_time = first_pm_bar["datetime"].strftime("%I:%M %p ET")
+                data_source = "Polygon 1-min PM extended hours"
+        elif entry_session == "am":
             minute_bars = (
                 fetch_polygon_minute_bars(symbol, entry_date, entry_date, session="am")
                 if polygon_api_key
@@ -2583,7 +2651,11 @@ def build_investment_simulation_rows(
         shares = hypothetical_shares if entry_allowed else 0.0
         target_price = entry_price * (1.0 + gain_pct)
         stop_price = entry_price * (1.0 - loss_pct)
-        end_idx = min(start_idx + follow_days, len(dates))
+        # A PM fill lands after the rank date's regular session, so that day's own
+        # high and low were set before the entry existed and would fabricate exits.
+        # Daily-OHLC scanning therefore starts the following trading day.
+        exit_scan_start_idx = start_idx + 1 if entry_session == "pm" else start_idx
+        end_idx = min(exit_scan_start_idx + follow_days, len(dates))
 
         status = "Open" if entry_allowed else "Blocked"
         exit_date: date | None = None
@@ -2595,9 +2667,10 @@ def build_investment_simulation_rows(
             symbol,
             entry_date,
             dates,
-            start_idx,
+            exit_scan_start_idx,
             target_price,
             stop_price,
+            entry_dt=entry_dt,
         )
         if intraday_price is not None and intraday_dt is not None:
             if entry_allowed:
@@ -2608,7 +2681,7 @@ def build_investment_simulation_rows(
             exit_reason = intraday_reason
             data_source = intraday_source
         else:
-            for idx in range(start_idx, end_idx):
+            for idx in range(exit_scan_start_idx, end_idx):
                 high_val = float(highs[idx])
                 low_val = float(lows[idx])
                 hit_target = high_val >= target_price
@@ -2638,7 +2711,7 @@ def build_investment_simulation_rows(
                     exit_reason = "+2% target"
                     break
 
-        if exit_price is None and end_idx - start_idx >= follow_days:
+        if exit_price is None and end_idx - exit_scan_start_idx >= follow_days:
             final_idx = end_idx - 1
             if entry_allowed:
                 status = "Closed"
@@ -3029,6 +3102,24 @@ def write_summary_only_sheet(
         include_market_status=True,
     )
 
+    pm_simulation_rows = build_investment_simulation_rows(
+        cohorts,
+        symbol_paths,
+        root,
+        position_size=position_size,
+        polygon_api_key=polygon_api_key,
+        intraday_exit_source=intraday_exit_source,
+        market_regimes=market_regimes,
+        entry_session="pm",
+    )
+    write_summary_sheet(
+        wb,
+        pm_simulation_rows,
+        sheet_name=PM_SIMULATION_SHEET_NAME,
+        include_entry_time=True,
+        include_market_status=True,
+    )
+
 
 def write_summary_sheet(
     wb: Workbook,
@@ -3055,6 +3146,18 @@ def write_summary_sheet(
         )
         if sheet_name == AM_SIMULATION_SHEET_NAME and SUMMARY_SHEET_NAME in wb.sheetnames:
             insert_at = wb.sheetnames.index(SUMMARY_SHEET_NAME) + 1
+        elif sheet_name == PM_SIMULATION_SHEET_NAME:
+            # Keep the three simulations adjacent and in session order.
+            anchor = next(
+                (
+                    name
+                    for name in (AM_SIMULATION_SHEET_NAME, SUMMARY_SHEET_NAME)
+                    if name in wb.sheetnames
+                ),
+                None,
+            )
+            if anchor is not None:
+                insert_at = wb.sheetnames.index(anchor) + 1
         ws = wb.create_sheet(title=sheet_name, index=insert_at)
 
     headers = [
