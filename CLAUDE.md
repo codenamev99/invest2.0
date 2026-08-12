@@ -46,14 +46,20 @@ refreshes price data, screens tickers, simulates trades, and emails a summary.
 
    PM Simulation additionally carries a `4M Daily Variance` column (mean of
    `(high - low) / low` over `VARIANCE_LOOKBACK_MONTHS`, as of each row's rank
-   date) and a movement test: an entry must sit at least `PM_MIN_MOVE_FROM_CLOSE`
-   (2%) away from the rank date's close, **in either direction, or it is excluded
-   from the totals** — listed with a reason, shares and investment zeroed, the
-   same treatment a blocked market regime gets. Note the direction: rows that
-   moved *less* than the threshold are the excluded ones, so any row that fell
-   back to the rank date's close scores a 0% move and is always excluded.
-   Totals are a `SUMIF(..., "Good*", ...)` over the condition column, so any
-   reason string that does not start with `Good` drops the row from the totals.
+   date) and a **headroom test** built on it. The strategy is a +2%/-1% scalp,
+   and a PM entry fills after the close, by which point the stock may already
+   have run up in extended hours. The test asks whether enough of the stock's
+   normal daily range is left to still reach the target:
+
+       run_up   = max(0, entry / rank_date_close - 1)   # downward moves cost nothing
+       headroom = variance_4m - run_up
+       excluded = headroom < gain_pct                   # gain_pct is the +2% target
+
+   Excluded rows are listed with the reason, shares and investment zeroed — the
+   same treatment a blocked market regime gets. Totals are a
+   `SUMIF(..., "Good*", ...)` over the condition column, so any reason string
+   that does not start with `Good` drops the row from the totals. The test is
+   skipped when there is too little history to compute a variance.
    "How It Works" is a non-technical guide to the pipeline, rebuilt each run
    from the live thresholds; adding a sheet means registering its name in
    `PROTECTED_SHEET_NAMES` here *and* in `send_daily_email.py`, which

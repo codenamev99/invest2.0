@@ -550,9 +550,13 @@ RUN_FINISHED_HEADER = "Run Finished"
 # A PM entry fills this many minutes after the run finished, which is when the
 # report has actually been read and an order could realistically be placed.
 PM_ENTRY_DELAY_MINUTES = 10
-# A PM entry must sit at least this far from the rank date's close to be counted
-# in the totals. Note the direction: rows moving LESS than this are excluded.
-PM_MIN_MOVE_FROM_CLOSE = 0.02
+# A PM entry fills after the close, by which point the stock may already have run
+# up in extended hours. What matters for a +2% scalp is how much of its typical
+# daily range is left: a name that has already travelled most of its average
+# high-low span is unlikely to hand over another full target. The headroom test
+# therefore subtracts the run-up from the average daily variance and requires at
+# least one target's worth to remain. Downward moves consume no upside, so only
+# upward moves count against the budget.
 # Lookback for the average daily high-low spread reported on PM Simulation.
 VARIANCE_LOOKBACK_MONTHS = 4
 SIMULATION_START_DATE = date(2026, 6, 12)
@@ -1102,12 +1106,24 @@ def write_how_it_works_sheet(wb: Workbook, args: Any, avg_vol_mode: str) -> None
         ),
         (
             "row",
-            "PM movement test",
-            f"A PM trade only counts if the entry price is at least "
-            f"{PM_MIN_MOVE_FROM_CLOSE:.0%} away from that day's closing price, up or down. "
-            "Anything that barely moved after the close is still listed, with the reason "
-            "shown, but is left out of the totals - the same treatment a blocked market day "
-            "gets.",
+            "PM headroom test",
+            "By the time the report is read, a stock may already have climbed in after-hours "
+            "trading. The question this asks is whether enough of its normal daily range is "
+            "left to still deliver the "
+            "2% target. Take the average daily range above, subtract how "
+            "much the stock has already risen since the close, and what remains is its room "
+            "to run. If that is under 2%, the trade is still listed with "
+            "the reason shown, but is left out of the totals - the same treatment a blocked "
+            "market day gets. Entering below the close costs nothing, since the whole range "
+            "is still above.",
+        ),
+        (
+            "row",
+            "Worked example",
+            "A stock averaging a 5.5% daily range, ranked at a $100.00 close. Bought at "
+            "$101.00 it is up 1%, leaving 4.5% of room, so it counts. Bought at $104.00 it is "
+            "up 4%, leaving only 1.5% - less than the 2% needed - so it is listed but "
+            "excluded.",
         ),
         (
             "row",
@@ -2850,16 +2866,21 @@ def build_investment_simulation_rows(
 
         variance_4m = average_daily_variance(dates, highs, lows, rank_date)
 
-        # A PM entry has to have moved at least PM_MIN_MOVE_FROM_CLOSE away from
-        # the rank date's close to count. Rows that moved less are still reported,
-        # but excluded from the totals the same way a blocked regime is.
+        # Rows failing the headroom test are still reported, but excluded from the
+        # totals the same way a blocked regime is.
         move_from_close: float | None = None
+        headroom: float | None = None
         move_excluded = False
         if entry_session == "pm":
             prev_close = float(closes[start_idx])
             if prev_close > 0:
                 move_from_close = (entry_price / prev_close) - 1.0
-                move_excluded = abs(move_from_close) < PM_MIN_MOVE_FROM_CLOSE
+                if variance_4m is not None:
+                    # Only the run-up eats into the day's range; entering below the
+                    # close leaves the full average span available above.
+                    run_up = max(0.0, move_from_close)
+                    headroom = variance_4m - run_up
+                    move_excluded = headroom < gain_pct
 
         counts_toward_totals = entry_allowed and not move_excluded
         investment_amount = position_size if counts_toward_totals else 0.0
@@ -2885,7 +2906,7 @@ def build_investment_simulation_rows(
         if not entry_allowed:
             exit_reason = "Market regime blocked entry"
         elif move_excluded:
-            exit_reason = "Entry too close to the previous close"
+            exit_reason = "Not enough of the daily range left to reach the target"
         else:
             exit_reason = "Open - waiting for threshold or day 5"
 
@@ -2971,14 +2992,19 @@ def build_investment_simulation_rows(
                 # A blocked regime outranks the move test, so its reason wins and
                 # the status column stays consistent with what is reported here.
                 "market_reason": (
-                    f"Excluded: entry is {move_from_close:+.2%} from the previous close; "
-                    f"needs at least {PM_MIN_MOVE_FROM_CLOSE:.0%} of movement."
-                    if status == "Excluded" and move_from_close is not None
+                    f"Excluded: already {move_from_close:+.2%} on a "
+                    f"{variance_4m:.2%} average daily range, leaving {headroom:.2%} "
+                    f"of room; needs {gain_pct:.0%}."
+                    if status == "Excluded"
+                    and move_from_close is not None
+                    and headroom is not None
+                    and variance_4m is not None
                     else market_regime.get("reason", "")
                 ),
                 "entry_fallback_reason": entry_fallback_reason,
                 "variance_4m": variance_4m,
                 "move_from_close": move_from_close,
+                "headroom": headroom,
             }
         )
 
