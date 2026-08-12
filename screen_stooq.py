@@ -2763,12 +2763,12 @@ def build_investment_simulation_rows(
                 else []
             )
             finished_at = run_finish_times.get(rank_date)
-            if finished_at is None:
-                # Runs predating the Run Finished column have no time to offset
-                # from, so the entry falls back to the open of the session.
-                target_dt = None
-                chosen_bar = next((bar for bar in pm_bars if bar["date"] == entry_date), None)
-            else:
+            # The newest cohort belongs to the run happening right now, which has
+            # not stamped its finish time yet. Its bars from earlier in the session
+            # do exist, but they are not the entry -- so it must not fall back to
+            # them, or every run would book a placeholder into its own totals.
+            is_current_run = rank_date == latest_rank_date
+            if finished_at is not None:
                 target_dt = finished_at + timedelta(minutes=PM_ENTRY_DELAY_MINUTES)
                 chosen_bar = next(
                     (
@@ -2778,6 +2778,14 @@ def build_investment_simulation_rows(
                     ),
                     None,
                 )
+            elif is_current_run:
+                target_dt = None
+                chosen_bar = None
+            else:
+                # Runs predating the Run Finished column have no time to offset
+                # from, so the entry falls back to the open of the session.
+                target_dt = None
+                chosen_bar = next((bar for bar in pm_bars if bar["date"] == entry_date), None)
 
             if chosen_bar is not None:
                 entry_price = float(chosen_bar["open"])
@@ -2793,12 +2801,7 @@ def build_investment_simulation_rows(
                         "Good - no run-finish time recorded for this date; used the "
                         "after-hours session open."
                     )
-            elif rank_date == latest_rank_date:
-                # The newest cohort belongs to the run happening right now, whose
-                # entry bar is still ten minutes away -- and whose finish time is
-                # not even stamped yet, since that happens after this runs. Either
-                # way the price is unknowable here, so the row is held rather than
-                # booked at a placeholder that would land in the totals.
+            elif is_current_run:
                 when = f"{target_dt:%I:%M %p ET} bar" if target_dt is not None else "entry bar"
                 append_ignored_row(
                     cohort,
