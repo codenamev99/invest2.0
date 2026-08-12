@@ -5,9 +5,10 @@ import calendar
 import csv
 import io
 import os
+import subprocess
 import warnings
 from bisect import bisect_left, bisect_right
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -544,6 +545,16 @@ INVESTMENT_DASHBOARD_SHEET_NAME = "Investment Dashboard"
 SUMMARY_SHEET_NAME = "Simulation"
 AM_SIMULATION_SHEET_NAME = "AM Simulation"
 PM_SIMULATION_SHEET_NAME = "PM Simulation"
+COMMIT_SUMMARY_SHEET_NAME = "Commit Summary"
+RUN_FINISHED_HEADER = "Run Finished"
+# A PM entry fills this many minutes after the run finished, which is when the
+# report has actually been read and an order could realistically be placed.
+PM_ENTRY_DELAY_MINUTES = 10
+# A PM entry must sit at least this far from the rank date's close to be counted
+# in the totals. Note the direction: rows moving LESS than this are excluded.
+PM_MIN_MOVE_FROM_CLOSE = 0.02
+# Lookback for the average daily high-low spread reported on PM Simulation.
+VARIANCE_LOOKBACK_MONTHS = 4
 SIMULATION_START_DATE = date(2026, 6, 12)
 LEGACY_SUMMARY_SHEET_NAME = "Summary"
 DAILY_RUNS_SHEET_NAME = "Daily Runs"
@@ -560,6 +571,7 @@ PROTECTED_SHEET_NAMES = {
     SUMMARY_SHEET_NAME,
     AM_SIMULATION_SHEET_NAME,
     PM_SIMULATION_SHEET_NAME,
+    COMMIT_SUMMARY_SHEET_NAME,
     LEGACY_SUMMARY_SHEET_NAME,
     DAILY_RUNS_SHEET_NAME,
 }
@@ -816,6 +828,78 @@ def write_recent_splits_sheet(
     auto_size_columns(ws, min_width=10, max_width=45)
 
 
+def write_commit_summary_sheet(wb: Workbook, limit: int = 200) -> None:
+    """
+    List the project's code changes, newest first, as a version history.
+
+    The automated "Update daily screener results" commits are filtered out: CI
+    makes one per weekday and they would bury the real changes. Silently skipped
+    when git is unavailable, so a checkout without history still produces a
+    workbook.
+    """
+    try:
+        completed = subprocess.run(
+            ["git", "log", f"-{limit}", "--date=format:%Y-%m-%d\t%H:%M", "--pretty=format:%ad\t%h\t%s"],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return
+    if completed.returncode != 0:
+        return
+
+    entries: list[tuple[str, str, str, str]] = []
+    for line in completed.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 4:
+            continue
+        day, clock, sha, subject = (p.strip() for p in parts)
+        if subject == "Update daily screener results":
+            continue
+        entries.append((day, clock, sha, subject))
+
+    sheet_name = COMMIT_SUMMARY_SHEET_NAME
+    if sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        for rng in list(ws.merged_cells.ranges):
+            ws.unmerge_cells(str(rng))
+        if ws.max_row > 0:
+            ws.delete_rows(1, ws.max_row)
+    else:
+        ws = wb.create_sheet(title=sheet_name)
+
+    black = Color(indexed=8)
+    white = Color(indexed=9)
+    header_font = Font(name="Calibri", size=11, bold=True, color=white)
+    body_font = Font(name="Calibri", size=11, color=black)
+    mono_font = Font(name="Consolas", size=10, color=black)
+    fill_black = PatternFill(fill_type="solid", fgColor=black)
+    wrap_top = Alignment(horizontal="left", vertical="top", wrap_text=True)
+    left_center = Alignment(horizontal="left", vertical="center")
+
+    ws.append(["Date", "Time", "Commit", "Change"])
+    for col_idx in range(1, 5):
+        cell = ws.cell(row=1, column=col_idx)
+        cell.font = header_font
+        cell.fill = fill_black
+        cell.alignment = left_center
+
+    for day, clock, sha, subject in entries:
+        ws.append([day, clock, sha, subject])
+        row_idx = ws.max_row
+        for col_idx in range(1, 5):
+            cell = ws.cell(row=row_idx, column=col_idx)
+            cell.font = mono_font if col_idx == 3 else body_font
+            cell.alignment = wrap_top
+
+    for col_letter, width in (("A", 13.0), ("B", 9.0), ("C", 11.0), ("D", 95.0)):
+        ws.column_dimensions[col_letter].width = width
+    ws.freeze_panes = "A2"
+    ws.sheet_view.showGridLines = False
+
+
 def write_how_it_works_sheet(wb: Workbook, args: Any, avg_vol_mode: str) -> None:
     """
     Create or replace the plain-English guide tab.
@@ -996,8 +1080,34 @@ def write_how_it_works_sheet(wb: Workbook, args: Any, avg_vol_mode: str) -> None
             f"$10,000 of each of the top {args.top_n} ranked stocks. Three entry times are "
             "compared: Simulation buys at the next morning's normal 9:30am open, AM Simulation "
             "at the earlier pre-market open that same morning, and PM Simulation on the "
-            "evening of the ranking day itself, in after-hours trading right after the 4pm "
-            "close.",
+            "evening of the ranking day itself, "
+            f"{PM_ENTRY_DELAY_MINUTES} minutes after this report finished running.",
+        ),
+        (
+            "row",
+            "The PM entry time",
+            f"The Daily Runs tab records the exact time each evening's run finished. "
+            f"PM Simulation buys at the price {PM_ENTRY_DELAY_MINUTES} minutes later, which is "
+            "roughly when the report could actually have been read and an order placed. That "
+            "price is only known after the fact, so the newest day's PM rows say Pending and "
+            "are priced on the following run.",
+        ),
+        (
+            "row",
+            f"{VARIANCE_LOOKBACK_MONTHS}M Daily Variance",
+            f"On PM Simulation, how far the stock typically travels in a day, averaged over "
+            f"the {VARIANCE_LOOKBACK_MONTHS} months before it was ranked. Each day contributes "
+            "the gap between its high and its low, measured against the low. A stock at 5% "
+            "swings that far between its cheapest and dearest price on a normal day.",
+        ),
+        (
+            "row",
+            "PM movement test",
+            f"A PM trade only counts if the entry price is at least "
+            f"{PM_MIN_MOVE_FROM_CLOSE:.0%} away from that day's closing price, up or down. "
+            "Anything that barely moved after the close is still listed, with the reason "
+            "shown, but is left out of the totals - the same treatment a blocked market day "
+            "gets.",
         ),
         (
             "row",
@@ -1043,8 +1153,16 @@ def write_how_it_works_sheet(wb: Workbook, args: Any, avg_vol_mode: str) -> None
             "row",
             PM_SIMULATION_SHEET_NAME,
             "The same trades bought the evening of the ranking day, in after-hours trading "
-            "just after the 4pm close, rather than waiting for the next morning. The five-day "
-            "clock still starts the following trading day.",
+            f"{PM_ENTRY_DELAY_MINUTES} minutes after the run finished, rather than waiting for "
+            "the next morning. The five-day clock still starts the following trading day. This "
+            "tab also carries the variance column and the movement test described above.",
+        ),
+        (
+            "row",
+            COMMIT_SUMMARY_SHEET_NAME,
+            "A dated list of every change made to this project, newest first, so any shift in "
+            "the numbers can be traced to the version that caused it. The automated daily "
+            "result uploads are left out.",
         ),
         (
             "row",
@@ -1101,6 +1219,13 @@ def write_how_it_works_sheet(wb: Workbook, args: Any, avg_vol_mode: str) -> None
         ),
         ("row", "Avg Daily $ Volume", f"Dollars traded on an average day over the last {vol_window}."),
         ("row", "Earnings Dates", "Most recent and next scheduled earnings announcement."),
+        (
+            "row",
+            RUN_FINISHED_HEADER,
+            "The time that evening's run finished, in New York time. PM Simulation prices its "
+            f"entries {PM_ENTRY_DELAY_MINUTES} minutes after this. Blank for runs made before "
+            "this was recorded.",
+        ),
         (
             "row",
             "The % columns",
@@ -1630,6 +1755,59 @@ def iter_run_rows(wb: Workbook):
         for row in ws.iter_rows(min_row=3, values_only=True):
             if row and row[0] is not None:
                 yield run_date, headers, row
+
+
+def stamp_run_finished(ws, run_date: date, finished_at: datetime) -> int:
+    """
+    Write the run-finish time onto every Daily Runs row for `run_date`.
+
+    Called just before the workbook is saved so the value really is the end of
+    the run, rather than the moment the sheet happened to be built. Returns the
+    number of rows stamped.
+    """
+    headers = [str(cell.value or "").strip() for cell in ws[1]]
+    try:
+        col = headers.index(RUN_FINISHED_HEADER) + 1
+    except ValueError:
+        return 0
+
+    stamped = 0
+    for row_idx in range(3, ws.max_row + 1):
+        if _coerce_date(ws.cell(row=row_idx, column=1).value) != run_date:
+            continue
+        ws.cell(row=row_idx, column=col, value=finished_at)
+        ws.cell(row=row_idx, column=col).number_format = "h:mm AM/PM"
+        stamped += 1
+    return stamped
+
+
+def collect_run_finish_times(wb: Workbook) -> dict[date, datetime]:
+    """
+    Read the run-finish time recorded for each run date on Daily Runs.
+
+    Rows predating the column simply have no entry, and callers fall back to
+    their own defaults rather than dropping the run.
+    """
+    out: dict[date, datetime] = {}
+    if DAILY_RUNS_SHEET_NAME not in wb.sheetnames:
+        return out
+    ws = wb[DAILY_RUNS_SHEET_NAME]
+    headers = [str(cell.value or "").strip() for cell in ws[1]]
+    try:
+        col = headers.index(RUN_FINISHED_HEADER) + 1
+    except ValueError:
+        return out
+
+    for row_idx in range(3, ws.max_row + 1):
+        run_date = _coerce_date(ws.cell(row=row_idx, column=1).value)
+        if run_date is None or run_date in out:
+            continue
+        value = ws.cell(row=row_idx, column=col).value
+        if isinstance(value, datetime):
+            out[run_date] = value
+        elif isinstance(value, time):
+            out[run_date] = datetime.combine(run_date, value)
+    return out
 
 
 def prepare_daily_runs_sheet(wb: Workbook, header_row: list[Any]):
@@ -2269,12 +2447,40 @@ def build_investment_simulation_rows(
     intraday_exit_source: str = "auto",
     market_regimes: dict[date, dict[str, Any]] | None = None,
     entry_session: str = "regular",
+    run_finish_times: dict[date, datetime] | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     ohlc_cache: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
     intraday_cache: dict[tuple[str, date, date, str], list[dict[str, Any]]] = {}
     market_series = _market_symbol_series(MARKET_REGIME_SPY, symbol_paths, root, ohlc_cache)
     market_dates = market_series[0] if market_series is not None else np.array([], dtype=np.int32)
+    run_finish_times = run_finish_times or {}
+    # The newest cohort is the run that just happened, so its PM entry bars do
+    # not exist yet; those rows are held pending instead of priced.
+    latest_rank_date = max((c["rank_date"] for c in cohorts), default=None)
+
+    def average_daily_variance(
+        dates_arr: np.ndarray,
+        highs_arr: np.ndarray,
+        lows_arr: np.ndarray,
+        as_of: date,
+    ) -> float | None:
+        """Mean of (high - low) / low over the lookback window ending at as_of."""
+        if len(dates_arr) == 0:
+            return None
+        start_int = date_to_int(shift_months(as_of, -VARIANCE_LOOKBACK_MONTHS))
+        end_int = date_to_int(as_of)
+        lo_idx = int(np.searchsorted(dates_arr, start_int, side="left"))
+        hi_idx = int(np.searchsorted(dates_arr, end_int, side="right"))
+        if hi_idx <= lo_idx:
+            return None
+        highs_win = np.asarray(highs_arr[lo_idx:hi_idx], dtype=float)
+        lows_win = np.asarray(lows_arr[lo_idx:hi_idx], dtype=float)
+        usable = np.isfinite(highs_win) & np.isfinite(lows_win) & (lows_win > 0)
+        if not usable.any():
+            return None
+        spread = (highs_win[usable] - lows_win[usable]) / lows_win[usable]
+        return float(np.mean(spread))
 
     def polygon_ticker(symbol: str) -> str:
         return normalize_symbol(symbol).removesuffix(".US")
@@ -2434,6 +2640,7 @@ def build_investment_simulation_rows(
         entry_date: date | None,
         reason: str,
         market_regime: dict[str, Any],
+        status: str = "Ignored",
     ) -> None:
         rows.append(
             {
@@ -2449,7 +2656,7 @@ def build_investment_simulation_rows(
                 "exit_time": "",
                 "exit_price": None,
                 "exit_reason": reason,
-                "status": "Ignored",
+                "status": status,
                 "result_currency": None,
                 "result_pct": None,
                 "data_source": "Unavailable",
@@ -2539,8 +2746,51 @@ def build_investment_simulation_rows(
                 if polygon_api_key
                 else []
             )
-            first_pm_bar = next((bar for bar in pm_bars if bar["date"] == entry_date), None)
-            if first_pm_bar is None:
+            finished_at = run_finish_times.get(rank_date)
+            if finished_at is None:
+                # Runs predating the Run Finished column have no time to offset
+                # from, so the entry falls back to the open of the session.
+                target_dt = None
+                chosen_bar = next((bar for bar in pm_bars if bar["date"] == entry_date), None)
+            else:
+                target_dt = finished_at + timedelta(minutes=PM_ENTRY_DELAY_MINUTES)
+                chosen_bar = next(
+                    (
+                        bar
+                        for bar in pm_bars
+                        if bar["date"] == entry_date and bar["datetime"] >= target_dt
+                    ),
+                    None,
+                )
+
+            if chosen_bar is not None:
+                entry_price = float(chosen_bar["open"])
+                entry_dt = chosen_bar["datetime"]
+                entry_time = chosen_bar["datetime"].strftime("%I:%M %p ET")
+                data_source = (
+                    "Polygon 1-min PM extended hours"
+                    if target_dt is not None
+                    else "Polygon 1-min PM extended hours (session open)"
+                )
+                if target_dt is None:
+                    entry_fallback_reason = (
+                        "Good - no run-finish time recorded for this date; used the "
+                        "after-hours session open."
+                    )
+            elif target_dt is not None and rank_date == latest_rank_date:
+                # This run is the one that produced the timestamp, so the bar it
+                # needs is still ten minutes away. The next run prices it.
+                append_ignored_row(
+                    cohort,
+                    symbol,
+                    entry_date,
+                    "Pending: entry price resolves on the next run "
+                    f"({target_dt:%I:%M %p ET} bar not published yet).",
+                    market_regime,
+                    status="Pending",
+                )
+                continue
+            else:
                 entry_price = float(closes[start_idx])
                 entry_time = "Market Close"
                 data_source = "Daily close PM fallback"
@@ -2548,11 +2798,6 @@ def build_investment_simulation_rows(
                     "Good - PM extended-hours data unavailable; used the rank date's "
                     "closing price."
                 )
-            else:
-                entry_price = float(first_pm_bar["open"])
-                entry_dt = first_pm_bar["datetime"]
-                entry_time = first_pm_bar["datetime"].strftime("%I:%M %p ET")
-                data_source = "Polygon 1-min PM extended hours"
         elif entry_session == "am":
             minute_bars = (
                 fetch_polygon_minute_bars(symbol, entry_date, entry_date, session="am")
@@ -2603,9 +2848,23 @@ def build_investment_simulation_rows(
             )
             continue
 
-        investment_amount = position_size if entry_allowed else 0.0
+        variance_4m = average_daily_variance(dates, highs, lows, rank_date)
+
+        # A PM entry has to have moved at least PM_MIN_MOVE_FROM_CLOSE away from
+        # the rank date's close to count. Rows that moved less are still reported,
+        # but excluded from the totals the same way a blocked regime is.
+        move_from_close: float | None = None
+        move_excluded = False
+        if entry_session == "pm":
+            prev_close = float(closes[start_idx])
+            if prev_close > 0:
+                move_from_close = (entry_price / prev_close) - 1.0
+                move_excluded = abs(move_from_close) < PM_MIN_MOVE_FROM_CLOSE
+
+        counts_toward_totals = entry_allowed and not move_excluded
+        investment_amount = position_size if counts_toward_totals else 0.0
         hypothetical_shares = position_size / entry_price
-        shares = hypothetical_shares if entry_allowed else 0.0
+        shares = hypothetical_shares if counts_toward_totals else 0.0
         target_price = entry_price * (1.0 + gain_pct)
         stop_price = entry_price * (1.0 - loss_pct)
         # A PM fill lands after the rank date's regular session, so that day's own
@@ -2614,11 +2873,21 @@ def build_investment_simulation_rows(
         exit_scan_start_idx = start_idx + 1 if entry_session == "pm" else start_idx
         end_idx = min(exit_scan_start_idx + follow_days, len(dates))
 
-        status = "Open" if entry_allowed else "Blocked"
+        if not entry_allowed:
+            status = "Blocked"
+        elif move_excluded:
+            status = "Excluded"
+        else:
+            status = "Open"
         exit_date: date | None = None
         exit_time = ""
         exit_price: float | None = None
-        exit_reason = "Open - waiting for threshold or day 5" if entry_allowed else "Market regime blocked entry"
+        if not entry_allowed:
+            exit_reason = "Market regime blocked entry"
+        elif move_excluded:
+            exit_reason = "Entry too close to the previous close"
+        else:
+            exit_reason = "Open - waiting for threshold or day 5"
 
         intraday_price, intraday_dt, intraday_reason, intraday_source = intraday_exit(
             symbol,
@@ -2630,7 +2899,7 @@ def build_investment_simulation_rows(
             entry_dt=entry_dt,
         )
         if intraday_price is not None and intraday_dt is not None:
-            if entry_allowed:
+            if counts_toward_totals:
                 status = "Closed"
             exit_date = intraday_dt.date()
             exit_time = intraday_dt.strftime("%I:%M %p ET")
@@ -2644,7 +2913,7 @@ def build_investment_simulation_rows(
                 hit_target = high_val >= target_price
                 hit_stop = low_val <= stop_price
                 if hit_target and hit_stop:
-                    if entry_allowed:
+                    if counts_toward_totals:
                         status = "Closed"
                     exit_date = date_from_int(int(dates[idx]))
                     exit_time = "Unavailable with daily OHLC"
@@ -2652,7 +2921,7 @@ def build_investment_simulation_rows(
                     exit_reason = "Both hit same day - assumed -1% first"
                     break
                 if hit_stop:
-                    if entry_allowed:
+                    if counts_toward_totals:
                         status = "Closed"
                     exit_date = date_from_int(int(dates[idx]))
                     exit_time = "Unavailable with daily OHLC"
@@ -2660,7 +2929,7 @@ def build_investment_simulation_rows(
                     exit_reason = "-1% stop"
                     break
                 if hit_target:
-                    if entry_allowed:
+                    if counts_toward_totals:
                         status = "Closed"
                     exit_date = date_from_int(int(dates[idx]))
                     exit_time = "Unavailable with daily OHLC"
@@ -2670,7 +2939,7 @@ def build_investment_simulation_rows(
 
         if exit_price is None and end_idx - exit_scan_start_idx >= follow_days:
             final_idx = end_idx - 1
-            if entry_allowed:
+            if counts_toward_totals:
                 status = "Closed"
             exit_date = date_from_int(int(dates[final_idx]))
             exit_time = "Market Close"
@@ -2698,9 +2967,18 @@ def build_investment_simulation_rows(
                 "result_pct": result_pct,
                 "data_source": data_source,
                 "market_regime": market_regime.get("regime", ""),
-                "market_entry_allowed": "Yes" if entry_allowed else "No",
-                "market_reason": market_regime.get("reason", ""),
+                "market_entry_allowed": "Yes" if counts_toward_totals else "No",
+                # A blocked regime outranks the move test, so its reason wins and
+                # the status column stays consistent with what is reported here.
+                "market_reason": (
+                    f"Excluded: entry is {move_from_close:+.2%} from the previous close; "
+                    f"needs at least {PM_MIN_MOVE_FROM_CLOSE:.0%} of movement."
+                    if status == "Excluded" and move_from_close is not None
+                    else market_regime.get("reason", "")
+                ),
                 "entry_fallback_reason": entry_fallback_reason,
+                "variance_4m": variance_4m,
+                "move_from_close": move_from_close,
             }
         )
 
@@ -3068,6 +3346,7 @@ def write_summary_only_sheet(
         intraday_exit_source=intraday_exit_source,
         market_regimes=market_regimes,
         entry_session="pm",
+        run_finish_times=collect_run_finish_times(wb),
     )
     write_summary_sheet(
         wb,
@@ -3075,6 +3354,7 @@ def write_summary_only_sheet(
         sheet_name=PM_SIMULATION_SHEET_NAME,
         include_entry_time=True,
         include_market_status=True,
+        include_variance=True,
     )
 
 
@@ -3084,6 +3364,7 @@ def write_summary_sheet(
     sheet_name: str = SUMMARY_SHEET_NAME,
     include_entry_time: bool = False,
     include_market_status: bool = False,
+    include_variance: bool = False,
 ) -> None:
     if LEGACY_SUMMARY_SHEET_NAME in wb.sheetnames and SUMMARY_SHEET_NAME not in wb.sheetnames:
         wb[LEGACY_SUMMARY_SHEET_NAME].title = SUMMARY_SHEET_NAME
@@ -3133,6 +3414,8 @@ def write_summary_sheet(
         "Result\n%",
         "# of Days open",
     ]
+    if include_variance:
+        headers.append(f"{VARIANCE_LOOKBACK_MONTHS}M Daily\nVariance")
     if include_market_status:
         headers.append("SPY - Market Condition")
     ws.append(headers)
@@ -3163,9 +3446,11 @@ def write_summary_sheet(
             row.get("result_pct") if exit_date else None,
             _trading_days_open(entry_date, exit_date) if is_closed else None,
         ]
+        if include_variance:
+            output_row.append(row.get("variance_4m"))
         if include_market_status:
-            if status in {"Blocked", "Ignored"}:
-                condition = row.get("market_reason")
+            if status in {"Blocked", "Ignored", "Excluded", "Pending"}:
+                condition = row.get("market_reason") or row.get("exit_reason")
             else:
                 condition = row.get("entry_fallback_reason") or "Good"
             output_row.append(condition)
@@ -3185,6 +3470,10 @@ def write_summary_sheet(
     result_pct_col = 9 + shift
     days_open_col = 10 + shift
     last_col = days_open_col
+    variance_col = None
+    if include_variance:
+        last_col += 1
+        variance_col = last_col
     if include_market_status:
         last_col += 1
     ws.cell(row=total_label_row, column=result_currency_col, value="TOTAL")
@@ -3314,6 +3603,8 @@ def write_summary_sheet(
             elif col_idx == result_pct_col:
                 cell.font = total_font if row_idx == total_label_row else result_font
                 cell.number_format = "@" if row_idx == total_label_row else result_pct_format
+            elif col_idx == variance_col:
+                cell.number_format = "0.00%"
             else:
                 cell.number_format = "General"
             if row_idx > data_end_row and row_idx not in {total_label_row, total_formula_row}:
@@ -3331,13 +3622,14 @@ def write_summary_sheet(
         for row_idx, simulation_row in enumerate(simulation_rows, start=2):
             row_status = str(simulation_row.get("status", "")).strip()
             used_regular_fallback = bool(simulation_row.get("entry_fallback_reason"))
-            if row_status not in {"Blocked", "Ignored"} and not used_regular_fallback:
+            excluded_statuses = {"Blocked", "Ignored", "Excluded", "Pending"}
+            if row_status not in excluded_statuses and not used_regular_fallback:
                 continue
-            row_fill = red_fill if row_status == "Blocked" else ignored_fill
+            row_fill = red_fill if row_status in {"Blocked", "Excluded"} else ignored_fill
             for col_idx in range(1, last_col + 1):
                 ws.cell(row=row_idx, column=col_idx).fill = row_fill
             ws.cell(row=row_idx, column=market_condition_col).font = (
-                red_font if row_status == "Blocked" else ignored_font
+                red_font if row_status in {"Blocked", "Excluded"} else ignored_font
             )
 
     ws.freeze_panes = None
@@ -4078,6 +4370,7 @@ def main() -> None:
         None,
         "Earnings Dates",
         None,
+        RUN_FINISHED_HEADER,
     ]
     data_keys = [
         "symbol",
@@ -4106,6 +4399,7 @@ def main() -> None:
         "avg_dollar_volume_pct_5",
         "last_earnings_date",
         "next_earnings_date",
+        "run_finished_at",
     ]
     if args.score_enable:
         header_row = header_row[:2] + ["Rank"] + header_row[2:]
@@ -4240,6 +4534,7 @@ def main() -> None:
         pct_desc,
         "Most recent",
         "Next",
+        "Eastern time",
     ]
     if args.score_enable:
         descriptors = descriptors[:2] + [None] + descriptors[2:]
@@ -4316,6 +4611,7 @@ def main() -> None:
                 fmt_pct_value(row.get("avg_dollar_volume_pct_5")),
                 parse_mmddyyyy(row.get("last_earnings_date")),
                 parse_mmddyyyy(row.get("next_earnings_date")),
+                row.get("run_finished_at"),
             ]
         )
         return output_row
@@ -4407,15 +4703,15 @@ def main() -> None:
     def shift_cols(cols: set[int]) -> set[int]:
         return {shift_col_idx(col) for col in cols}
 
-    header_style_cols = shift_cols({1, 2, 3, 4, 6, 8, 10, 12, 14, 16, 17, 19, 21, 23, 25})
-    header_value_cols = shift_cols({2, 3, 4, 6, 8, 10, 12, 14, 16, 17, 19, 21, 23, 25})
+    header_style_cols = shift_cols({1, 2, 3, 4, 6, 8, 10, 12, 14, 16, 17, 19, 21, 23, 25, 27})
+    header_value_cols = shift_cols({2, 3, 4, 6, 8, 10, 12, 14, 16, 17, 19, 21, 23, 25, 27})
     header_style_cols.add(1)
     if args.score_enable:
         header_style_cols.update({4})
         header_value_cols.update({4})
-    left_thick_cols = shift_cols({4, 6, 8, 10, 12, 14, 16, 17, 19, 21, 23, 25})
-    right_thick_cols = shift_cols({5, 7, 9, 11, 13, 15, 16, 18, 20, 22, 24, 26})
-    header_right_cols = {shift_col_idx(25), shift_col_idx(26)}
+    left_thick_cols = shift_cols({4, 6, 8, 10, 12, 14, 16, 17, 19, 21, 23, 25, 27})
+    right_thick_cols = shift_cols({5, 7, 9, 11, 13, 15, 16, 18, 20, 22, 24, 26, 27})
+    header_right_cols = {shift_col_idx(25), shift_col_idx(26), shift_col_idx(27)}
 
     # Column widths from the sample spreadsheet
     base_column_widths = {
@@ -4445,6 +4741,7 @@ def main() -> None:
         24: 12.5312,
         25: 14.2734,
         26: 13.0,
+        27: 16.0,
     }
     column_widths = (
         {shift_col_idx(k): v for k, v in base_column_widths.items()}
@@ -4519,6 +4816,7 @@ def main() -> None:
         24: pct_literal_format,
         25: "mmm d, yyyy",
         26: "mmm d, yyyy",
+        27: "h:mm AM/PM",
     }
     number_formats = (
         {shift_col_idx(k): v for k, v in base_number_formats.items()}
@@ -4616,7 +4914,14 @@ def main() -> None:
         market_regime_mode=args.market_regime_mode,
     )
     write_how_it_works_sheet(wb, args, avg_vol_mode)
+    write_commit_summary_sheet(wb)
     prune_old_run_sheets(wb, keep_runs=15)
+
+    # Stamped last so the recorded time is the end of the run. The PM simulation
+    # prices its entries off this, but only on a later run: the bars it needs are
+    # ten minutes in the future at the moment this is written.
+    finished_at = datetime.now(EASTERN_TZ).replace(tzinfo=None, second=0, microsecond=0)
+    stamp_run_finished(wb[DAILY_RUNS_SHEET_NAME], data_date, finished_at)
 
     wb.save(out_path)
 
