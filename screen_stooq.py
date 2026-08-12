@@ -127,27 +127,13 @@ def load_series_from_file(
     return d, c, v, h, l
 
 
-# A close-to-close move this large is not a real price move: it is a split,
-# spinoff or special distribution putting later rows on a different per-share
-# basis than earlier ones. Genuine one-day crashes rarely reach 2x.
-PRICE_BASIS_GAP_RATIO = 2.0
-
-
 class HistoryHigh(NamedTuple):
     """
     Highest daily high in a symbol's stored history.
-
-    post_gap_high is set only when `high` predates a price-basis discontinuity,
-    i.e. when the headline number describes a share that no longer exists. It is
-    the highest high since that discontinuity, so it is comparable to today's
-    close. Callers report both rather than silently substituting, because the
-    same test also fires on genuine one-day crashes.
     """
 
     high: float
     date_int: int
-    post_gap_high: float | None
-    post_gap_date_int: int | None
 
 
 def scan_all_time_high(path: Path) -> HistoryHigh | None:
@@ -159,7 +145,7 @@ def scan_all_time_high(path: Path) -> HistoryHigh | None:
     resolve to the most recent date, matching max_value_and_days_ago. Returns
     None when the file has no usable daily rows.
     """
-    rows: list[tuple[int, float, float]] = []
+    rows: list[tuple[int, float]] = []
     with path.open("r", encoding="utf-8", errors="ignore") as f:
         for ln in f:
             ln = ln.strip()
@@ -179,10 +165,12 @@ def scan_all_time_high(path: Path) -> HistoryHigh | None:
 
             if AS_OF_DATE_INT is not None and date_i > AS_OF_DATE_INT:
                 continue
+            # The close is parsed only to reject rows the screener would also
+            # reject; the high is the value this scan reports.
             if not np.isfinite(high) or not np.isfinite(close):
                 continue
 
-            rows.append((date_i, high, close))
+            rows.append((date_i, high))
 
     if not rows:
         return None
@@ -195,33 +183,9 @@ def scan_all_time_high(path: Path) -> HistoryHigh | None:
         if rows[i][1] >= rows[best_idx][1]:
             best_idx = i
 
-    # Last basis change in either direction: a reverse split gaps up, a forward
-    # split or spinoff gaps down. Only rows at or after it share today's basis.
-    gap_idx = 0
-    for i in range(1, len(rows)):
-        prev_close, close = rows[i - 1][2], rows[i][2]
-        if prev_close <= 0 or close <= 0:
-            continue
-        ratio = prev_close / close
-        if ratio > PRICE_BASIS_GAP_RATIO or ratio < 1.0 / PRICE_BASIS_GAP_RATIO:
-            gap_idx = i
-
-    post_gap_high = None
-    post_gap_date_int = None
-    if gap_idx > 0 and best_idx < gap_idx:
-        tail = rows[gap_idx:]
-        post_idx = 0
-        for i in range(1, len(tail)):
-            if tail[i][1] >= tail[post_idx][1]:
-                post_idx = i
-        post_gap_high = float(tail[post_idx][1])
-        post_gap_date_int = int(tail[post_idx][0])
-
     return HistoryHigh(
         high=float(rows[best_idx][1]),
         date_int=int(rows[best_idx][0]),
-        post_gap_high=post_gap_high,
-        post_gap_date_int=post_gap_date_int,
     )
 
 
@@ -3711,9 +3675,11 @@ def main() -> None:
         choices=MARKET_REGIME_MODES,
         default=MARKET_REGIME_DEFAULT_MODE,
         help=(
+            # Percent signs are doubled: argparse runs help through %-formatting,
+            # and Python 3.14 rejects a single %% as a badly formed help string.
             "Market-regime entry gate for the Investment Dashboard. "
-            "standard uses SPY > 50DMA and SPY 5D > -2%; "
-            "aggressive also requires SPY > 200DMA, SPY 20DMA > 50DMA, and SPY 5D > 0%."
+            "standard uses SPY > 50DMA and SPY 5D > -2%%; "
+            "aggressive also requires SPY > 200DMA, SPY 20DMA > 50DMA, and SPY 5D > 0%%."
         ),
     )
 
