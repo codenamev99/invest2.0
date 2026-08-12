@@ -2793,15 +2793,18 @@ def build_investment_simulation_rows(
                         "Good - no run-finish time recorded for this date; used the "
                         "after-hours session open."
                     )
-            elif target_dt is not None and rank_date == latest_rank_date:
-                # This run is the one that produced the timestamp, so the bar it
-                # needs is still ten minutes away. The next run prices it.
+            elif rank_date == latest_rank_date:
+                # The newest cohort belongs to the run happening right now, whose
+                # entry bar is still ten minutes away -- and whose finish time is
+                # not even stamped yet, since that happens after this runs. Either
+                # way the price is unknowable here, so the row is held rather than
+                # booked at a placeholder that would land in the totals.
+                when = f"{target_dt:%I:%M %p ET} bar" if target_dt is not None else "entry bar"
                 append_ignored_row(
                     cohort,
                     symbol,
                     entry_date,
-                    "Pending: entry price resolves on the next run "
-                    f"({target_dt:%I:%M %p ET} bar not published yet).",
+                    f"Pending: entry price resolves on the next run ({when} not published yet).",
                     market_regime,
                     status="Pending",
                 )
