@@ -22,6 +22,8 @@ PM_SIMULATION_SHEET_NAME = "PM Simulation"
 COMMIT_SUMMARY_SHEET_NAME = "Commit Summary"
 LEGACY_SIMULATION_SHEET_NAME = "Summary"
 DAILY_RUNS_SHEET_NAME = "Daily Runs"
+# Lower-cased and newline-stripped, matching how the sheet headers are normalized.
+MARKET_CONDITION_HEADER = "spy - market condition"
 PROTECTED_SHEETS = {
     "Single Tickers",
     HOW_IT_WORKS_SHEET_NAME,
@@ -266,6 +268,17 @@ def simulation_sheet_totals_html(wb, sheet_names: tuple[str, ...], label: str) -
         result_pct_col = normalized_headers.index("result %") + 1
     except ValueError:
         return f"<p>{html.escape(label)} totals: Result columns not found.</p>"
+
+    # The sheet totals are SUMIF(..., "Good*", ...) over the market-condition
+    # column, so blocked, excluded, ignored and pending rows are left out. The
+    # fallback below has to apply the same filter or the email reports trades the
+    # workbook does not count. Sheets written without that column (the legacy
+    # Summary tab) total with a plain SUM, which is what a missing column means.
+    condition_col = (
+        normalized_headers.index(MARKET_CONDITION_HEADER) + 1
+        if MARKET_CONDITION_HEADER in normalized_headers
+        else None
+    )
     total_label_row = None
     for row_idx in range(1, ws.max_row + 1):
         labels = {
@@ -283,18 +296,27 @@ def simulation_sheet_totals_html(wb, sheet_names: tuple[str, ...], label: str) -
     dollar_value = ws.cell(row=total_formula_row, column=result_currency_col).value
     percent_value = ws.cell(row=total_formula_row, column=result_pct_col).value
 
+    def counted_total(column: int) -> float:
+        """Sum one result column the way the sheet's own TOTAL formula does."""
+        total = 0.0
+        for row_idx in range(2, total_label_row):
+            if condition_col is not None:
+                condition = str(ws.cell(row=row_idx, column=condition_col).value or "")
+                if not condition.strip().lower().startswith("good"):
+                    continue
+            value = ws.cell(row=row_idx, column=column).value
+            if isinstance(value, (int, float)):
+                total += float(value)
+        return total
+
+    # openpyxl writes formulas but never evaluates them, so a workbook this
+    # pipeline just wrote has no cached result for the TOTAL cells and these read
+    # back as None. The recomputed totals are the normal path, not a rare
+    # fallback; a real number only appears here once Excel has saved the file.
     if not isinstance(dollar_value, (int, float)):
-        dollar_value = sum(
-            float(ws.cell(row=row_idx, column=result_currency_col).value or 0)
-            for row_idx in range(2, total_label_row)
-            if isinstance(ws.cell(row=row_idx, column=result_currency_col).value, (int, float))
-        )
+        dollar_value = counted_total(result_currency_col)
     if not isinstance(percent_value, (int, float)):
-        percent_value = sum(
-            float(ws.cell(row=row_idx, column=result_pct_col).value or 0)
-            for row_idx in range(2, total_label_row)
-            if isinstance(ws.cell(row=row_idx, column=result_pct_col).value, (int, float))
-        )
+        percent_value = counted_total(result_pct_col)
 
     dollar_total = format_value(dollar_value, '"$"#,##0.00')
     percent_total = format_value(percent_value, "0.00%")

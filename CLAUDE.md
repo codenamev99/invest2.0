@@ -13,6 +13,21 @@ refreshes price data, screens tickers, simulates trades, and emails a summary.
    - Preferred: `refresh_polygon_daily.py` pulls from the Polygon.io API
      (`POLYGON_API_KEY` env var). Bootstraps full history if `data 2` is
      missing, otherwise does an incremental backfill.
+
+     After the backfill it runs a **split repair** pass. Polygon's adjusted
+     bars are adjusted as of the request, and the backfill only rewrites the
+     last `POLYGON_BACKFILL_DAYS`, so a split otherwise leaves everything older
+     than that window on the pre-split factor and the file keeps a permanent
+     price seam at the window edge — corrupting 52-week/multi-year highs, the
+     RSI/MACD averages, average dollar volume, beta, and the simulation's daily
+     OHLC exit scan. The pass lists splits from the last
+     `POLYGON_SPLIT_REPAIR_DAYS` (must stay well above `POLYGON_BACKFILL_DAYS`),
+     refetches each affected symbol's full stored range — authoritative for
+     whatever the plan serves — and rescales anything older only when the seam
+     is still measurably present, so re-running it is a no-op. Handled splits
+     are recorded in `data 2/daily/us/.split_repairs.json` so each is repaired
+     once; delete that file to force a re-check. Disable with
+     `--no-split-repair`.
    - Fallback: `refresh_stooq_dump.py` imports a manually downloaded Stooq
      bulk dump (`STOOQ_SRC` env var / `--src` flag) — used only if
      `POLYGON_API_KEY` is unset.
@@ -88,7 +103,7 @@ better than -2%).
 - `POLYGON_API_KEY` — required for Polygon refresh + intraday target/stop
   simulation; never commit this, set it in the shell/scheduler.
 - `POLYGON_BOOTSTRAP_YEARS` (default 2), `POLYGON_BACKFILL_DAYS` (default 60),
-  `POLYGON_RATE_LIMIT_SLEEP`
+  `POLYGON_SPLIT_REPAIR_DAYS` (default 120), `POLYGON_RATE_LIMIT_SLEEP`
 - `STOOQ_SRC`, `STOOQ_MODE` (`copy`|`move`) — Stooq fallback, only used if
   `POLYGON_API_KEY` is unset
 - `SMTP_HOST/PORT/USERNAME/PASSWORD`, `EMAIL_FROM`, `EMAIL_TO`,
@@ -111,5 +126,15 @@ updated `results.xlsx` back to the repo as `github-actions[bot]`.
 - No automated test suite exists. Sanity-check changes to `screen_stooq.py`
   by running `--run_mode single --single_symbol <TICKER>` against existing
   `data 2` before running the full universe.
+- `--as_of_date` is a real cutoff: `load_series_from_file`,
+  `scan_all_time_high` and `load_ohlc_from_file` all drop rows past it, so a
+  historical replay sees only the data that existed then. Any new file reader
+  must honour `AS_OF_DATE_INT` too, or the simulation gets to see the bars it
+  is supposed to be predicting.
+- Simulation totals are `SUMIF(..., "Good*", ...)` over the market-condition
+  column. openpyxl writes formulas but never evaluates them, so a workbook this
+  pipeline just wrote has no cached total — `send_daily_email.py` recomputes
+  both totals in Python and must keep applying the same `Good*` filter, or the
+  email reports trades the workbook does not count.
 - No live broker integration — the "Simulation"/"AM Simulation" sheets are
   paper-trading only.

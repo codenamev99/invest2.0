@@ -193,7 +193,11 @@ def scan_all_time_high(path: Path) -> HistoryHigh | None:
 def load_ohlc_from_file(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Returns (dates_int, open, high, low, close) sorted by date.
-    Reads the full file so validation can look forward from older ranking dates.
+    Reads the full file so validation can look forward from older ranking dates,
+    but never past AS_OF_DATE_INT: --as_of_date exists so a historical run can be
+    replayed with only the data that existed then, and the simulation, the market
+    regime gate and OHLC tracking all read through here. Without the cutoff they
+    would see the very bars they are supposed to be predicting.
     """
     rows: list[tuple[int, float, float, float, float]] = []
     with path.open("r", encoding="utf-8", errors="ignore") as f:
@@ -213,6 +217,9 @@ def load_ohlc_from_file(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray,
                 low = float(parts[6])
                 close = float(parts[7])
             except ValueError:
+                continue
+
+            if AS_OF_DATE_INT is not None and date_i > AS_OF_DATE_INT:
                 continue
 
             rows.append((date_i, open_, high, low, close))

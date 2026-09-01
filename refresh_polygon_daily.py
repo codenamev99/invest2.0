@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import time
@@ -9,6 +10,7 @@ from collections import OrderedDict
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 warnings.filterwarnings(
     "ignore",
@@ -20,7 +22,20 @@ import requests
 GROUPED_DAILY_URL = "https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{date}"
 TICKER_DAILY_URL = "https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}"
 REFERENCE_TICKERS_URL = "https://api.polygon.io/v3/reference/tickers"
+SPLITS_URL = "https://api.polygon.io/stocks/v1/splits"
 STOOQ_HEADER = "<TICKER>,<PER>,<DATE>,<TIME>,<OPEN>,<HIGH>,<LOW>,<CLOSE>,<VOL>,<OPENINT>"
+EASTERN_TZ = ZoneInfo("America/New_York")
+
+# Which splits have already been dealt with, so a repair runs once per split
+# rather than on every run for as long as it stays inside the lookback window.
+SPLIT_STATE_FILENAME = ".split_repairs.json"
+# A row still on the old factor sits at split_from/split_to of its adjusted
+# value, so an unrepaired seam reads as a close-to-close ratio of
+# split_to/split_from. Genuine overnight gaps do not land near a split ratio, so
+# a loose band still tells the two apart.
+SPLIT_SEAM_TOLERANCE = 0.15
+# Below this the ratio is too close to 1 for the seam test to mean anything.
+SPLIT_MIN_RATIO_DISTANCE = 0.05
 
 
 def resolve_path(p: str) -> Path:
@@ -149,6 +164,22 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=float(os.environ.get("POLYGON_RATE_LIMIT_SLEEP", "13")),
         help="Seconds to sleep between bootstrap API calls. 13 seconds is safe for free-tier limits.",
+    )
+    ap.add_argument(
+        "--split-repair-days",
+        type=int,
+        default=int(os.environ.get("POLYGON_SPLIT_REPAIR_DAYS", "120")),
+        help=(
+            "Look this many calendar days back for splits and restate the affected "
+            "symbols' stored history. Keep it comfortably above --backfill-days so a "
+            "missed run cannot let a split slip past. The first run repairs every "
+            "split in the window, so it is slower than later ones. Default: 120."
+        ),
+    )
+    ap.add_argument(
+        "--no-split-repair",
+        action="store_true",
+        help="Skip the post-refresh split repair pass.",
     )
     return ap.parse_args()
 
@@ -632,6 +663,371 @@ def merge_counts(total: dict[str, int], counts: dict[str, int]) -> None:
         total[key] = total.get(key, 0) + value
 
 
+# -----------------------------
+# Split repair
+#
+# Polygon's adjusted bars are adjusted as of the moment they are requested, and
+# the daily backfill only rewrites its own recent window. A split therefore
+# leaves every row older than that window sitting on the pre-split factor, and
+# the file keeps a permanent price seam at the window edge. That corrupts every
+# level-based figure computed across it -- 52-week and multi-year highs, the
+# RSI/MACD averages, average dollar volume, beta, and the simulation's daily
+# OHLC exit scan.
+# -----------------------------
+def bar_trading_date(timestamp_ms: Any) -> date | None:
+    """Polygon stamps a daily bar at midnight Eastern on its trading day."""
+    if timestamp_ms is None:
+        return None
+    try:
+        return datetime.fromtimestamp(float(timestamp_ms) / 1000.0, tz=EASTERN_TZ).date()
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+def date_int_to_date(date_int: int) -> date:
+    return datetime.strptime(str(date_int), "%Y%m%d").date()
+
+
+def ratio_leg_text(value: float) -> str:
+    return str(int(value)) if float(value).is_integer() else f"{value:g}"
+
+
+def price_text(value: float) -> str:
+    """
+    Format a price for a Stooq-style row.
+
+    Rescaling multiplies by a ratio, which leaves float noise like
+    49.999999999999996. These files carry plain decimals, so trim to a precision
+    no US equity quote exceeds and drop the trailing zeros.
+    """
+    text = f"{value:.6f}".rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def parse_stooq_row(line: str) -> dict[str, Any] | None:
+    parts = line.strip().split(",")
+    if len(parts) < 9 or parts[1] != "D":
+        return None
+    try:
+        return {
+            "symbol": parts[0],
+            "date_int": int(parts[2]),
+            "open": float(parts[4]),
+            "high": float(parts[5]),
+            "low": float(parts[6]),
+            "close": float(parts[7]),
+            "volume": float(parts[8]),
+            "openint": parts[9] if len(parts) > 9 else "0",
+        }
+    except ValueError:
+        return None
+
+
+def format_stooq_row(row: dict[str, Any]) -> str:
+    return ",".join(
+        [
+            str(row["symbol"]),
+            "D",
+            str(row["date_int"]),
+            "000000",
+            price_text(row["open"]),
+            price_text(row["high"]),
+            price_text(row["low"]),
+            price_text(row["close"]),
+            str(int(round(row["volume"]))),
+            str(row.get("openint", "0")),
+        ]
+    )
+
+
+def split_state_path(root: Path) -> Path:
+    return root / SPLIT_STATE_FILENAME
+
+
+def load_split_repair_state(root: Path) -> dict[str, Any]:
+    path = split_state_path(root)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        # A damaged state file only costs a redundant repair pass, which is a
+        # no-op on already-correct history, so it is not worth failing the run.
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_split_repair_state(root: Path, state: dict[str, Any], keep_since: date) -> None:
+    pruned = {
+        key: value
+        for key, value in state.items()
+        if str((value or {}).get("execution_date", "")) >= keep_since.isoformat()
+    }
+    path = split_state_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(pruned, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def fetch_splits_since(api_key: str, since: date) -> list[dict[str, Any]]:
+    """Every split Polygon reports as executing on or after `since`."""
+    rows: list[dict[str, Any]] = []
+    params: dict[str, Any] = {
+        "execution_date.gte": since.isoformat(),
+        "sort": "execution_date.desc",
+        "limit": 1000,
+        "apiKey": api_key,
+    }
+    url: str | None = SPLITS_URL
+    while url:
+        resp = requests.get(url, params=params, timeout=60)
+        if resp.status_code in {401, 403}:
+            raise RuntimeError("Polygon rejected the API key while listing splits.")
+        resp.raise_for_status()
+        payload = resp.json()
+        for row in payload.get("results") or []:
+            ticker = str(row.get("ticker") or "").strip()
+            try:
+                executed = parse_yyyy_mm_dd(str(row.get("execution_date")))
+                split_from = float(row.get("split_from"))
+                split_to = float(row.get("split_to"))
+            except (TypeError, ValueError):
+                continue
+            if not ticker or split_from <= 0 or split_to <= 0:
+                continue
+            rows.append(
+                {
+                    "ticker": ticker,
+                    "execution_date": executed,
+                    "split_from": split_from,
+                    "split_to": split_to,
+                }
+            )
+        url = payload.get("next_url") or None
+        params = {"apiKey": api_key}
+    return rows
+
+
+def fetch_ticker_daily(
+    api_key: str,
+    ticker: str,
+    start: date,
+    end: date,
+    adjusted: bool = True,
+) -> list[dict[str, Any]]:
+    """Full daily history for one ticker over a date range."""
+    bars: list[dict[str, Any]] = []
+    url: str | None = TICKER_DAILY_URL.format(
+        ticker=ticker, start=start.isoformat(), end=end.isoformat()
+    )
+    params: dict[str, Any] = {
+        "adjusted": str(adjusted).lower(),
+        "sort": "asc",
+        "limit": 50000,
+        "apiKey": api_key,
+    }
+    while url:
+        resp = requests.get(url, params=params, timeout=60)
+        if resp.status_code in {401, 403}:
+            raise RuntimeError(f"Polygon rejected the API key while fetching {ticker} history.")
+        resp.raise_for_status()
+        payload = resp.json()
+        bars.extend(payload.get("results") or [])
+        url = payload.get("next_url") or None
+        params = {"apiKey": api_key}
+    return bars
+
+
+def rescale_pre_split_rows(
+    rows: list[dict[str, Any]],
+    seam_date_int: int,
+    split_from: float,
+    split_to: float,
+) -> int:
+    """
+    Divide out a split still sitting in the rows before `seam_date_int`.
+
+    `seam_date_int` is where the stale region ends: the split's execution date,
+    or the start of whatever range Polygon just refetched when that is earlier,
+    because refetching part of the history moves the seam to the edge of the
+    served range rather than removing it.
+
+    The rescale only happens when the seam is measurably there, so it is a no-op
+    on history Polygon served whole. That is what makes a second pass over an
+    already-correct file safe. Returns the number of rows restated.
+    """
+    seam_ratio = split_to / split_from
+    if abs(seam_ratio - 1.0) < SPLIT_MIN_RATIO_DISTANCE:
+        return 0
+
+    seam_idx = next(
+        (idx for idx, row in enumerate(rows) if row["date_int"] >= seam_date_int),
+        None,
+    )
+    if not seam_idx:
+        # None means the history ends before the seam; 0 means it starts after
+        # it. Either way there is nothing on the old factor to restate.
+        return 0
+
+    before = rows[seam_idx - 1]["close"]
+    after = rows[seam_idx]["close"]
+    if before <= 0 or after <= 0:
+        return 0
+    if abs((before / after) / seam_ratio - 1.0) > SPLIT_SEAM_TOLERANCE:
+        return 0
+
+    price_factor = split_from / split_to
+    for row in rows[:seam_idx]:
+        for field in ("open", "high", "low", "close"):
+            row[field] = row[field] * price_factor
+        row["volume"] = row["volume"] / price_factor
+    return seam_idx
+
+
+def repair_symbol_split_history(
+    path: Path,
+    ticker: str,
+    execution_date: date,
+    split_from: float,
+    split_to: float,
+    api_key: str,
+    dry_run: bool,
+) -> dict[str, int] | None:
+    """
+    Restate one symbol's stored history onto the current split factor.
+
+    Polygon's own history is authoritative for whatever range the plan serves,
+    so that range is replaced outright. Anything older than what it returns is
+    rescaled instead, and only when the seam is still detectable.
+    """
+    lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    header_lines = [line for line in lines if row_date(line) is None]
+    existing: dict[int, dict[str, Any]] = {}
+    for line in lines:
+        parsed = parse_stooq_row(line)
+        if parsed is not None:
+            existing[parsed["date_int"]] = parsed
+    if not existing:
+        return None
+
+    symbol = existing[min(existing)]["symbol"]
+    bars = fetch_ticker_daily(
+        api_key, ticker, date_int_to_date(min(existing)), date_int_to_date(max(existing))
+    )
+
+    replaced = 0
+    served: list[int] = []
+    for bar in bars:
+        trading_date = bar_trading_date(bar.get("t"))
+        if trading_date is None:
+            continue
+        date_int = int(trading_date.strftime("%Y%m%d"))
+        try:
+            row = {
+                "symbol": symbol,
+                "date_int": date_int,
+                "open": float(bar["o"]),
+                "high": float(bar["h"]),
+                "low": float(bar["l"]),
+                "close": float(bar["c"]),
+                "volume": float(bar.get("v") or 0),
+                "openint": "0",
+            }
+        except (KeyError, TypeError, ValueError):
+            continue
+        if date_int in existing:
+            replaced += 1
+        existing[date_int] = row
+        served.append(date_int)
+
+    ordered = [existing[key] for key in sorted(existing)]
+    # Rows Polygon served are authoritative, so the stale region ends wherever
+    # its range starts -- which is earlier than the split whenever the plan's
+    # history window does not reach all the way back through the file.
+    execution_int = int(execution_date.strftime("%Y%m%d"))
+    seam_date_int = min(min(served), execution_int) if served else execution_int
+    rescaled = rescale_pre_split_rows(ordered, seam_date_int, split_from, split_to)
+
+    if not dry_run:
+        out = header_lines + [format_stooq_row(row) for row in ordered]
+        path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    return {"replaced": replaced, "rescaled": rescaled, "rows": len(ordered)}
+
+
+def repair_split_adjusted_history(args: argparse.Namespace, root: Path, api_key: str) -> None:
+    """Restate stored history for every tracked symbol that split recently."""
+    if args.no_split_repair or args.split_repair_days <= 0:
+        return
+
+    since = date.today() - timedelta(days=args.split_repair_days)
+    try:
+        splits = fetch_splits_since(api_key, since)
+    except (requests.RequestException, RuntimeError, ValueError) as exc:
+        print(f"Warning: could not list recent splits from Polygon ({exc}); history left as is.")
+        return
+
+    state = load_split_repair_state(root)
+    symbol_paths = build_file_map(root)
+    mode = "DRY RUN: " if args.dry_run else ""
+    pending = [
+        split
+        for split in splits
+        if f"{split['ticker']}@{split['execution_date'].isoformat()}" not in state
+        and normalize_polygon_symbol(split["ticker"]).upper() in symbol_paths
+    ]
+    if not pending:
+        print(
+            f"Split repair: nothing to restate since {since.isoformat()} "
+            f"({len(splits)} splits seen, all already handled or untracked)."
+        )
+        return
+
+    print(f"{mode}Split repair: restating {len(pending)} symbol(s) since {since.isoformat()}.")
+    repaired = 0
+    for idx, split in enumerate(pending):
+        ticker = split["ticker"]
+        ratio = f"{ratio_leg_text(split['split_from'])}:{ratio_leg_text(split['split_to'])}"
+        path = symbol_paths[normalize_polygon_symbol(ticker).upper()]
+        try:
+            outcome = repair_symbol_split_history(
+                path,
+                ticker,
+                split["execution_date"],
+                split["split_from"],
+                split["split_to"],
+                api_key,
+                dry_run=args.dry_run,
+            )
+        except (requests.RequestException, RuntimeError, ValueError, OSError) as exc:
+            print(f"Warning: could not restate {ticker} after its {ratio} split ({exc}).")
+            continue
+        if outcome is None:
+            print(f"Skipped {ticker}: stored file has no usable daily rows.")
+            continue
+
+        repaired += 1
+        print(
+            f"{mode}Restated {ticker} for its {split['execution_date'].isoformat()} {ratio} split: "
+            f"{outcome['replaced']} rows refetched, {outcome['rescaled']} older rows rescaled, "
+            f"{outcome['rows']} rows total."
+        )
+        state[f"{ticker}@{split['execution_date'].isoformat()}"] = {
+            "ticker": ticker,
+            "execution_date": split["execution_date"].isoformat(),
+            "ratio": ratio,
+            "repaired_at": datetime.now().isoformat(timespec="seconds"),
+            "rows_refetched": outcome["replaced"],
+            "rows_rescaled": outcome["rescaled"],
+        }
+        if args.rate_limit_sleep > 0 and idx < len(pending) - 1:
+            time.sleep(args.rate_limit_sleep)
+
+    if repaired and not args.dry_run:
+        # Keep the window wider than the lookback so an entry cannot be pruned
+        # while its split is still listed, which would repair it a second time.
+        save_split_repair_state(root, state, keep_since=since - timedelta(days=args.split_repair_days))
+    print(f"{mode}Split repair complete -> restated={repaired}, skipped={len(pending) - repaired}.")
+
+
 def backfill_recent_days(args: argparse.Namespace, root: Path, new_symbols_dir: Path | None, api_key: str) -> None:
     dates = backfill_candidate_dates(args.backfill_days, include_today=args.include_today)
     if not dates:
@@ -704,6 +1100,8 @@ def main() -> None:
             include_today=args.include_today,
             dry_run=args.dry_run,
         )
+        # Last, so it restates history the backfill above has already written.
+        repair_split_adjusted_history(args, root, api_key)
         return
 
     if args.date:
@@ -735,6 +1133,7 @@ def main() -> None:
         f"added={counts['added']}, updated={counts['updated']}, "
         f"unchanged={counts['unchanged']}, skipped_new_or_invalid={counts['skipped']}"
     )
+    repair_split_adjusted_history(args, root, api_key)
 
 
 if __name__ == "__main__":
