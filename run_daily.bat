@@ -29,7 +29,7 @@ rem Example: set "STOOQ_SRC=C:\Users\YourName\Downloads\d_us_txt"
 set "STOOQ_SRC="
 set "STOOQ_MODE=copy"
 set "DATA_DEST=%PROJECT_DIR%data 2"
-set "TICKERS_FILE=%PROJECT_DIR%nyse_tickers.csv"
+set "TICKERS_FILE=%PROJECT_DIR%us_tickers.csv"
 set "RESULTS_FILE=%PROJECT_DIR%results.xlsx"
 set "ROOT_DATA=%PROJECT_DIR%data 2\daily\us"
 set "BENCHMARK=SPY.US"
@@ -39,7 +39,7 @@ if "%POLYGON_BACKFILL_DAYS%"=="" set "POLYGON_BACKFILL_DAYS=60"
 rem -------- Daily Steps --------
 if not "%POLYGON_API_KEY%"=="" (
     if not exist "%ROOT_DATA%\nyse stocks" (
-        echo NYSE data folder missing; bootstrapping %POLYGON_BOOTSTRAP_YEARS% years from Polygon.
+        echo Stock data folders missing; bootstrapping %POLYGON_BOOTSTRAP_YEARS% years from Polygon.
         %PYTHON_CMD% refresh_polygon_daily.py --bootstrap --include-today --root "%ROOT_DATA%" --bootstrap-years "%POLYGON_BOOTSTRAP_YEARS%"
         if errorlevel 1 (
             echo ERROR: Polygon bootstrap failed. Check POLYGON_API_KEY, plan history, and rate limits.
@@ -74,7 +74,13 @@ if not exist "%ROOT_DATA%\nyse stocks" (
     exit /b 1
 )
 
-%PYTHON_CMD% generate_tickers.py --dir "%ROOT_DATA%\nyse stocks" --out "%TICKERS_FILE%"
+if not exist "%ROOT_DATA%\nasdaq stocks" (
+    echo NOTE: no "%ROOT_DATA%\nasdaq stocks" folder; screening NYSE only.
+    echo       To add NASDAQ history, run refresh_polygon_daily.py once with
+    echo       --bootstrap --replace-existing.
+)
+
+%PYTHON_CMD% generate_tickers.py --dir "%ROOT_DATA%\nyse stocks" "%ROOT_DATA%\nasdaq stocks" --out "%TICKERS_FILE%"
 if errorlevel 1 exit /b 1
 
 %PYTHON_CMD% screen_stooq.py --run_mode all --tickers "%TICKERS_FILE%" --root "%ROOT_DATA%" --benchmark "%BENCHMARK%" --out "%RESULTS_FILE%"

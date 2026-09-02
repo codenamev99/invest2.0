@@ -146,7 +146,7 @@ def diff_series(actual: np.ndarray, ref: np.ndarray) -> tuple[float, float, int]
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", default="${workspaceFolder}/data 2/daily/us")
-    ap.add_argument("--dirs", default="nyse stocks,etfs")
+    ap.add_argument("--dirs", default="nyse stocks,nasdaq stocks,etfs")
     ap.add_argument("--benchmark", default="SPY.US")
     ap.add_argument("--symbols", default="", help="Comma-separated symbols to test (default: random sample).")
     ap.add_argument("--sample-size", type=int, default=50)

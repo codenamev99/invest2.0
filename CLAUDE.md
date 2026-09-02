@@ -1,6 +1,6 @@
 # invest2.0
 
-Daily NYSE stock screener and paper-trading simulator. Python script suite (no
+Daily NYSE + NASDAQ stock screener and paper-trading simulator. Python script suite (no
 package manifest, no web framework) that runs on a GitHub Actions cron,
 refreshes price data, screens tickers, simulates trades, and emails a summary.
 
@@ -8,8 +8,8 @@ refreshes price data, screens tickers, simulates trades, and emails a summary.
 
 `run_daily.sh` (macOS/Linux) / `run_daily.bat` (Windows) chain these steps:
 
-1. **Refresh price data** into `data 2/daily/us/{nyse stocks,etfs}/` (Stooq-format
-   per-ticker daily OHLCV `.txt` files):
+1. **Refresh price data** into `data 2/daily/us/{nyse stocks,nasdaq stocks,etfs}/`
+   (Stooq-format per-ticker daily OHLCV `.txt` files):
    - Preferred: `refresh_polygon_daily.py` pulls from the Polygon.io API
      (`POLYGON_API_KEY` env var). Bootstraps full history if `data 2` is
      missing, otherwise does an incremental backfill.
@@ -31,8 +31,24 @@ refreshes price data, screens tickers, simulates trades, and emails a summary.
    - Fallback: `refresh_stooq_dump.py` imports a manually downloaded Stooq
      bulk dump (`STOOQ_SRC` env var / `--src` flag) — used only if
      `POLYGON_API_KEY` is unset.
-2. **Rebuild ticker universe**: `generate_tickers.py` scans
-   `data 2/daily/us/nyse stocks/*.txt` → writes `nyse_tickers.csv`.
+2. **Rebuild ticker universe**: `generate_tickers.py` pools
+   `data 2/daily/us/{nyse stocks,nasdaq stocks}/*.txt` → writes `us_tickers.csv`.
+   `--dir` takes one or more folders; a folder that does not exist is skipped
+   with a note, so a NYSE-only checkout still runs.
+
+   The venue split comes from the bootstrap: `fetch_reference_symbols` maps each
+   `primary_exchange` (`XNYS`/`XNAS`) to its folder via `EXCHANGE_DIRS`, and
+   `--bootstrap-universe` (`us` default, or `nyse`/`nasdaq`/`all`) picks which
+   venues to include. Only `CS`/`ADRC`/`ADRP` are kept — warrants, units, rights
+   and preferred shares are not traded here. ETFs are restricted to
+   `BENCHMARK_ETFS` (SPY, QQQ), the only two anything reads; fetching the full
+   US ETF list instead costs ~5,400 files nothing ever opens.
+
+   **The daily backfill cannot add a new venue.** `upsert_grouped_bars` skips
+   symbols with no existing file, so switching `--bootstrap-universe` only takes
+   effect on a `--bootstrap --replace-existing` rebuild. The grouped-daily
+   endpoint already returns the whole US market in one call per trading day, so
+   widening the universe costs disk and screening CPU but no extra API calls.
 3. **Screen + simulate**: `screen_stooq.py` (~3600 lines, the core engine) —
    computes RSI/MACD/ATR/beta-vs-SPY, screens for setups, runs a simulated
    trade tracker (+2% target / -1% stop-loss, using Polygon 1-minute bars
@@ -86,7 +102,7 @@ refreshes price data, screens tickers, simulates trades, and emails a summary.
 
 ```bash
 ./run_daily.sh                 # full pipeline, uses env vars below
-python screen_stooq.py --tickers nyse_tickers.csv --root "data 2/daily/us" \
+python screen_stooq.py --tickers us_tickers.csv --root "data 2/daily/us" \
     --benchmark SPY.US --run_mode all --out results.xlsx
 python screen_stooq.py --run_mode single --single_symbol AAPL --root "data 2/daily/us" ...
 ```
@@ -120,9 +136,9 @@ updated `results.xlsx` back to the repo as `github-actions[bot]`.
 
 - `data 2/` and `results.xlsx` are treated as generated/cached state, not
   hand-edited source — they're rewritten by every daily run and committed by
-  CI. `nyse_tickers.csv` and `results.csv` are gitignored (regenerated
-  locally) despite `nyse_tickers.csv` currently being tracked — don't add
-  logic that depends on either being fresh in a clean checkout.
+  CI. `us_tickers.csv` and `results.csv` are gitignored and regenerated
+  locally — don't add logic that depends on either being fresh in a clean
+  checkout.
 - No automated test suite exists. Sanity-check changes to `screen_stooq.py`
   by running `--run_mode single --single_symbol <TICKER>` against existing
   `data 2` before running the full universe.

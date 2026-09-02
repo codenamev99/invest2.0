@@ -10,3 +10,4 @@ data [0-9]*/
 *.xlsx.bak
 results.csv
 nyse_tickers.csv
+us_tickers.csv

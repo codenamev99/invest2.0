@@ -949,7 +949,7 @@ def write_how_it_works_sheet(wb: Workbook, args: Any, avg_vol_mode: str) -> None
         (
             "text",
             "",
-            "A program runs by itself every weekday evening. It looks at every NYSE stock we "
+            "A program runs by itself every weekday evening. It looks at every NYSE and NASDAQ stock we "
             "track, keeps the handful that look like short-term momentum setups, ranks them, "
             "and then plays out a pretend trade on each one. No real money is involved and "
             "nothing here is a recommendation to buy or sell anything.",
@@ -3966,7 +3966,7 @@ def main() -> None:
     tickers_group.add_argument("--tickers", help="CSV with tickers (column: symbol or ticker)")
     tickers_group.add_argument(
         "--tickers_dir",
-        help='Directory containing *.us.txt files to screen (e.g. "${workspaceFolder}/data/daily/us/nyse stocks")',
+        help='Directory tree containing *.us.txt files to screen (e.g. "${workspaceFolder}/data/daily/us"); scanned recursively',
     )
     ap.add_argument("--root", required=True, help='Root folder: e.g. "${workspaceFolder}/data/daily/us" or "/Users/v/Downloads/data/daily/us"')
     ap.add_argument(

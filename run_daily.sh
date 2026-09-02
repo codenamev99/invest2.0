@@ -25,7 +25,7 @@ fi
 STOOQ_SRC=""
 STOOQ_MODE="move"
 DATA_DEST="$PROJECT_DIR/data 2"
-TICKERS_FILE="$PROJECT_DIR/nyse_tickers.csv"
+TICKERS_FILE="$PROJECT_DIR/us_tickers.csv"
 RESULTS_FILE="$PROJECT_DIR/results.xlsx"
 ROOT_DATA="$PROJECT_DIR/data 2/daily/us"
 BENCHMARK="SPY.US"
@@ -42,8 +42,16 @@ fi
 # -------- Daily Steps --------
 if [ -n "${POLYGON_API_KEY:-}" ]; then
   if [ ! -d "$ROOT_DATA/nyse stocks" ]; then
-    echo "NYSE data folder missing; bootstrapping ${POLYGON_BOOTSTRAP_YEARS} years from Polygon."
+    echo "Stock data folders missing; bootstrapping ${POLYGON_BOOTSTRAP_YEARS} years from Polygon."
     $PYTHON_CMD refresh_polygon_daily.py --bootstrap --include-today --root "$ROOT_DATA" --bootstrap-years "$POLYGON_BOOTSTRAP_YEARS"
+  elif [ ! -d "$ROOT_DATA/nasdaq stocks" ]; then
+    # The daily backfill only touches symbols that already have a file, so it
+    # cannot introduce NASDAQ on its own. Keep screening NYSE rather than firing
+    # a bootstrap that would abort on the existing data, and say what is needed.
+    echo "NOTE: no '$ROOT_DATA/nasdaq stocks' folder; screening NYSE only."
+    echo "      To add NASDAQ history, run once:"
+    echo "        POLYGON_RATE_LIMIT_SLEEP=0 $PYTHON_CMD refresh_polygon_daily.py \\"
+    echo "          --bootstrap --replace-existing --include-today --root \"$ROOT_DATA\""
   fi
   $PYTHON_CMD refresh_polygon_daily.py --include-today --ensure-benchmark-history-days 400 --root "$ROOT_DATA" --backfill-days "$POLYGON_BACKFILL_DAYS"
 elif [ -n "$STOOQ_SRC" ]; then
@@ -56,7 +64,7 @@ if [ "${SKIP_PIP_INSTALL:-0}" != "1" ] && [ -f "requirements.txt" ]; then
   $PYTHON_CMD -m pip install -r "requirements.txt"
 fi
 
-$PYTHON_CMD generate_tickers.py --dir "$ROOT_DATA/nyse stocks" --out "$TICKERS_FILE"
+$PYTHON_CMD generate_tickers.py --dir "$ROOT_DATA/nyse stocks" "$ROOT_DATA/nasdaq stocks" --out "$TICKERS_FILE"
 
 $PYTHON_CMD screen_stooq.py --run_mode all --tickers "$TICKERS_FILE" --root "$ROOT_DATA" --benchmark "$BENCHMARK" --out "$RESULTS_FILE"
 

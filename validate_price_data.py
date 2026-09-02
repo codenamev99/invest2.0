@@ -257,7 +257,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", default="${workspaceFolder}/data 2/daily/us",
                      help='Root folder containing Stooq-style US folders, e.g. "data 2/daily/us".')
-    ap.add_argument("--dirs", default="nyse stocks,etfs",
+    ap.add_argument("--dirs", default="nyse stocks,nasdaq stocks,etfs",
                      help="Comma-separated subfolders under --root to scan.")
     ap.add_argument("--benchmark", default="SPY.US",
                      help="Symbol used to derive the expected trading-day calendar.")

@@ -21,16 +21,24 @@ def resolve_path(p: str) -> Path:
     return Path(p).resolve()
 
 
-def collect_tickers(root: Path) -> list[str]:
+def collect_tickers(roots: list[Path]) -> list[str]:
     """
-    Collect tickers from *.txt files under root.
+    Collect tickers from *.txt files under every root that exists.
+
+    A missing folder is skipped rather than fatal: a NYSE-only checkout has no
+    "nasdaq stocks" directory, and a run that covered one venue should not fail
+    just because the other has not been bootstrapped yet.
     """
     out: set[str] = set()
-    for p in root.rglob("*.txt"):
-        sym = p.name.replace(".txt", "").upper()
-        if not sym.endswith(".US"):
-            sym = f"{sym}.US"
-        out.add(sym)
+    for root in roots:
+        if not root.exists():
+            print(f"Skipping missing folder: {root}")
+            continue
+        for p in root.rglob("*.txt"):
+            sym = p.name.replace(".txt", "").upper()
+            if not sym.endswith(".US"):
+                sym = f"{sym}.US"
+            out.add(sym)
     return sorted(out)
 
 
@@ -38,23 +46,29 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--dir",
-        default="${workspaceFolder}/data/daily/us/nyse stocks",
-        help="Folder containing Stooq NYSE *.txt files",
+        nargs="+",
+        default=[
+            "${workspaceFolder}/data/daily/us/nyse stocks",
+            "${workspaceFolder}/data/daily/us/nasdaq stocks",
+        ],
+        help="One or more folders of Stooq-format *.txt files to pool into the universe",
     )
     ap.add_argument(
         "--out",
-        default="${workspaceFolder}/nyse_tickers.csv",
+        default="${workspaceFolder}/us_tickers.csv",
         help="Output CSV path",
     )
     args = ap.parse_args()
 
-    root = resolve_path(args.dir)
+    roots = [resolve_path(d) for d in args.dir]
     out_path = resolve_path(args.out)
 
-    if not root.exists():
-        raise SystemExit(f"Input folder not found: {root}")
+    if not any(root.exists() for root in roots):
+        raise SystemExit(
+            "None of the requested folders exist: " + ", ".join(str(r) for r in roots)
+        )
 
-    tickers = collect_tickers(root)
+    tickers = collect_tickers(roots)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     with out_path.open("w", newline="") as f:

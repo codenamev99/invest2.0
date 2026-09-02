@@ -31,7 +31,7 @@
       "args": [
         "${workspaceFolder}/screen_stooq.py",
         "--tickers",
-        "${workspaceFolder}/nyse_tickers.csv",
+        "${workspaceFolder}/us_tickers.csv",
         "--root",
         "${workspaceFolder}/data/daily/us",
         "--benchmark",
@@ -60,7 +60,7 @@
       "args": [
         "${workspaceFolder}/screen_stooq.py",
         "--tickers",
-        "${workspaceFolder}/nyse_tickers.csv",
+        "${workspaceFolder}/us_tickers.csv",
         "--root",
         "${workspaceFolder}/data/daily/us",
         "--benchmark",

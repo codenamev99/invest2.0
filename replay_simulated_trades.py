@@ -257,7 +257,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--results", default="results.xlsx")
     ap.add_argument("--root", default="${workspaceFolder}/data 2/daily/us")
-    ap.add_argument("--dirs", default="nyse stocks,etfs")
+    ap.add_argument("--dirs", default="nyse stocks,nasdaq stocks,etfs")
     ap.add_argument("--sheets", default="Simulation,AM Simulation")
     ap.add_argument("--follow-days", type=int, default=5)
     ap.add_argument("--gain-pct", type=float, default=0.02)

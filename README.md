@@ -99,7 +99,7 @@ This will:
 - Bootstrap missing Polygon history if `POLYGON_API_KEY` is set and `data 2` is missing
 - Refresh from Polygon if `POLYGON_API_KEY` is set, otherwise copy/refresh Stooq data if `STOOQ_SRC` is set
 - Install requirements (if needed)
-- Generate `nyse_tickers.csv`
+- Generate `us_tickers.csv` (NYSE + NASDAQ)
 - Run the screener
 
 ## 8) Find the results

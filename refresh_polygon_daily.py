@@ -6,7 +6,7 @@ import os
 import shutil
 import time
 import warnings
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -24,6 +24,26 @@ TICKER_DAILY_URL = "https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/{
 REFERENCE_TICKERS_URL = "https://api.polygon.io/v3/reference/tickers"
 SPLITS_URL = "https://api.polygon.io/stocks/v1/splits"
 STOOQ_HEADER = "<TICKER>,<PER>,<DATE>,<TIME>,<OPEN>,<HIGH>,<LOW>,<CLOSE>,<VOL>,<OPENINT>"
+
+# One folder per listing venue, matching Stooq's own layout so the
+# refresh_stooq_dump.py fallback stays coherent with what Polygon writes.
+EXCHANGE_DIRS = {"XNYS": "nyse stocks", "XNAS": "nasdaq stocks"}
+MIXED_EXCHANGE_DIR = "us stocks"
+# Which venues each --bootstrap-universe covers. "all" has no reference lookup
+# at all, so it is not listed here.
+UNIVERSE_EXCHANGES = {
+    "us": ("XNYS", "XNAS"),
+    "nyse": ("XNYS",),
+    "nasdaq": ("XNAS",),
+}
+# Common stock plus the two ADR classes; everything else on these venues is a
+# warrant, unit, right or preferred share, which this screener does not trade.
+EQUITY_TYPES = {"CS", "ADRC", "ADRP"}
+# The screener reads exactly two ETFs -- SPY for the beta benchmark, QQQ for the
+# market regime gate -- so those are the only ones worth storing. Fetching every
+# US ETF instead costs thousands of files and hundreds of megabytes that nothing
+# ever opens.
+BENCHMARK_ETFS = {"SPY.US", "QQQ.US"}
 EASTERN_TZ = ZoneInfo("America/New_York")
 
 # Which splits have already been dealt with, so a repair runs once per split
@@ -150,9 +170,13 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument(
         "--bootstrap-universe",
-        choices=["nyse", "all"],
-        default="nyse",
-        help="Universe to write during bootstrap. Default: NYSE common stocks plus ETFs needed for benchmarks.",
+        choices=["us", "nyse", "nasdaq", "all"],
+        default="us",
+        help=(
+            "Universe to write during bootstrap. Default 'us' is NYSE plus NASDAQ common "
+            "stock and ADRs, along with the benchmark ETFs. 'nyse'/'nasdaq' restrict to one "
+            "venue; 'all' writes every symbol Polygon returns into a single folder."
+        ),
     )
     ap.add_argument(
         "--replace-existing",
@@ -340,12 +364,18 @@ def fetch_grouped_daily_with_retries(
     return []
 
 
-def fetch_reference_symbols(api_key: str, rate_limit_sleep: float) -> tuple[set[str], set[str]]:
+def fetch_reference_symbols(
+    api_key: str,
+    rate_limit_sleep: float,
+    exchanges: tuple[str, ...],
+) -> dict[str, str]:
     """
-    Return (NYSE common stock symbols, ETF symbols) normalized to *.US.
+    Map each tradable symbol on `exchanges` to the folder it belongs in.
+
+    Only common stock and ADRs are returned; ETFs are not looked up here because
+    the screener needs just the two benchmarks in BENCHMARK_ETFS.
     """
-    stock_symbols: set[str] = set()
-    etf_symbols: set[str] = set()
+    stock_dirs: dict[str, str] = {}
     next_url: str | None = REFERENCE_TICKERS_URL
     params: dict[str, Any] | None = {
         "market": "stocks",
@@ -376,18 +406,15 @@ def fetch_reference_symbols(api_key: str, rate_limit_sleep: float) -> tuple[set[
             symbol = normalize_polygon_symbol(ticker)
             security_type = str(item.get("type") or "").upper()
             primary_exchange = str(item.get("primary_exchange") or "").upper()
-            if security_type == "ETF":
-                etf_symbols.add(symbol)
-            elif primary_exchange == "XNYS" and security_type in {"CS", "ADRC", "ADRP"}:
-                stock_symbols.add(symbol)
+            if primary_exchange in exchanges and security_type in EQUITY_TYPES:
+                stock_dirs[symbol] = EXCHANGE_DIRS[primary_exchange]
 
         next_url = payload.get("next_url")
         params = {"apiKey": api_key} if next_url else None
         if next_url:
             time.sleep(rate_limit_sleep)
 
-    etf_symbols.add("SPY.US")
-    return stock_symbols, etf_symbols
+    return stock_dirs
 
 
 def bootstrap_date_range(args: argparse.Namespace) -> list[date]:
@@ -448,17 +475,19 @@ class AppendFileCache:
 def bootstrap_target_path(
     root: Path,
     symbol: str,
-    stock_symbols: set[str],
+    stock_dirs: dict[str, str],
     etf_symbols: set[str],
     universe: str,
 ) -> Path | None:
     if symbol in etf_symbols:
         return root / "etfs" / symbol_to_file_name(symbol)
-    if universe == "all" or not stock_symbols:
-        return root / "nyse stocks" / symbol_to_file_name(symbol)
-    if symbol in stock_symbols:
-        return root / "nyse stocks" / symbol_to_file_name(symbol)
-    return None
+    if universe == "all" or not stock_dirs:
+        # No per-symbol venue is known, so everything shares one folder.
+        return root / MIXED_EXCHANGE_DIR / symbol_to_file_name(symbol)
+    subdir = stock_dirs.get(symbol)
+    if subdir is None:
+        return None
+    return root / subdir / symbol_to_file_name(symbol)
 
 
 def bootstrap_history(args: argparse.Namespace, root: Path, api_key: str) -> None:
@@ -471,12 +500,16 @@ def bootstrap_history(args: argparse.Namespace, root: Path, api_key: str) -> Non
     if existing_files and args.replace_existing and not args.dry_run:
         shutil.rmtree(root)
 
-    stock_symbols: set[str] = set()
-    etf_symbols: set[str] = {"SPY.US"}
-    if args.bootstrap_universe == "nyse":
-        print("Fetching Polygon ticker reference for NYSE common stocks...")
-        stock_symbols, etf_symbols = fetch_reference_symbols(api_key, args.rate_limit_sleep)
-        print(f"Reference universe: {len(stock_symbols)} NYSE common stocks, {len(etf_symbols)} ETFs.")
+    stock_dirs: dict[str, str] = {}
+    etf_symbols: set[str] = set(BENCHMARK_ETFS)
+    exchanges = UNIVERSE_EXCHANGES.get(args.bootstrap_universe)
+    if exchanges:
+        venues = ", ".join(EXCHANGE_DIRS[code].removesuffix(" stocks").upper() for code in exchanges)
+        print(f"Fetching Polygon ticker reference for {venues} common stocks...")
+        stock_dirs = fetch_reference_symbols(api_key, args.rate_limit_sleep, exchanges)
+        per_venue = Counter(stock_dirs.values())
+        breakdown = ", ".join(f"{count} in {name}" for name, count in sorted(per_venue.items()))
+        print(f"Reference universe: {len(stock_dirs)} stocks ({breakdown}), {len(etf_symbols)} benchmark ETFs.")
 
     dates = bootstrap_date_range(args)
     if not dates:
@@ -486,8 +519,11 @@ def bootstrap_history(args: argparse.Namespace, root: Path, api_key: str) -> Non
         f"Bootstrapping Polygon history from {dates[0].isoformat()} to {dates[-1].isoformat()} "
         f"({len(dates)} weekdays)."
     )
-    if args.bootstrap_universe == "nyse":
-        print("Free-tier rate limits make the first build slow; this is expected.")
+    if args.rate_limit_sleep > 0:
+        print(
+            f"Sleeping {args.rate_limit_sleep:g}s between calls for free-tier rate limits; "
+            "set POLYGON_RATE_LIMIT_SLEEP=0 on a paid plan to skip the wait."
+        )
 
     counts = {"days_with_data": 0, "rows_written": 0, "skipped": 0}
     with AppendFileCache(dry_run=args.dry_run) as files:
@@ -507,7 +543,7 @@ def bootstrap_history(args: argparse.Namespace, root: Path, api_key: str) -> Non
                     counts["skipped"] += 1
                     continue
                 symbol = normalize_polygon_symbol(raw_symbol)
-                path = bootstrap_target_path(root, symbol, stock_symbols, etf_symbols, args.bootstrap_universe)
+                path = bootstrap_target_path(root, symbol, stock_dirs, etf_symbols, args.bootstrap_universe)
                 if path is None:
                     counts["skipped"] += 1
                     continue
