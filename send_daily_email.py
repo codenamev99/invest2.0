@@ -13,7 +13,10 @@ from openpyxl import load_workbook
 
 RESULTS_PATH = Path(os.environ.get("RESULTS_FILE", "results.xlsx"))
 HOW_IT_WORKS_SHEET_NAME = "How It Works"
-RECENT_SPLITS_SHEET_NAME = "Recent Splits (90D)"
+# Legacy tab from when splits were tracked. screen_stooq.py deletes it on the
+# next run, but it stays listed here so a workbook that still carries it is
+# not mistaken for the ranked stock list in the meantime.
+LEGACY_SPLITS_SHEET_NAME = "Recent Splits (90D)"
 UPCOMING_IPOS_SHEET_NAME = "Upcoming IPOs (60D)"
 UPCOMING_EARNINGS_SHEET_NAME = "Upcoming Earnings (14D)"
 SIMULATION_SHEET_NAME = "Simulation"
@@ -27,7 +30,7 @@ MARKET_CONDITION_HEADER = "spy - market condition"
 PROTECTED_SHEETS = {
     "Single Tickers",
     HOW_IT_WORKS_SHEET_NAME,
-    RECENT_SPLITS_SHEET_NAME,
+    LEGACY_SPLITS_SHEET_NAME,
     UPCOMING_IPOS_SHEET_NAME,
     UPCOMING_EARNINGS_SHEET_NAME,
     "Top 10 OHLC Tracking",

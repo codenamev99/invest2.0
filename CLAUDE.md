@@ -13,24 +13,7 @@ refreshes price data, screens tickers, simulates trades, and emails a summary.
    - Preferred: `refresh_polygon_daily.py` pulls from the Polygon.io API
      (`POLYGON_API_KEY` env var). Bootstraps full history if `data 2` is
      missing, otherwise does an incremental backfill.
-
-     After the backfill it runs a **split repair** pass. Polygon's adjusted
-     bars are adjusted as of the request, and the backfill only rewrites the
-     last `POLYGON_BACKFILL_DAYS`, so a split otherwise leaves everything older
-     than that window on the pre-split factor and the file keeps a permanent
-     price seam at the window edge — corrupting 52-week/multi-year highs, the
-     RSI/MACD averages, average dollar volume, beta, and the simulation's daily
-     OHLC exit scan. The pass lists splits from the last
-     `POLYGON_SPLIT_REPAIR_DAYS` (must stay well above `POLYGON_BACKFILL_DAYS`),
-     refetches each affected symbol's full stored range — authoritative for
-     whatever the plan serves — and rescales anything older only when the seam
-     is still measurably present, so re-running it is a no-op. Handled splits
-     are recorded in `data 2/daily/us/.split_repairs.json` so each is repaired
-     once; delete that file to force a re-check. Disable with
-     `--no-split-repair`.
-   - Fallback: `refresh_stooq_dump.py` imports a manually downloaded Stooq
-     bulk dump (`STOOQ_SRC` env var / `--src` flag) — used only if
-     `POLYGON_API_KEY` is unset.
+t.
 2. **Rebuild ticker universe**: `generate_tickers.py` pools
    `data 2/daily/us/{nyse stocks,nasdaq stocks}/*.txt` → writes `us_tickers.csv`.
    `--dir` takes one or more folders; a folder that does not exist is skipped
@@ -57,8 +40,8 @@ refreshes price data, screens tickers, simulates trades, and emails a summary.
    IPOs (60d) / earnings (14d, via the public Nasdaq calendar API). Writes
    `results.xlsx` (sheets: How It Works, Single Tickers, Simulation, AM
    Simulation, PM Simulation, Commit Summary, Investment Dashboard, Upcoming
-   IPOs/Earnings, Recent Splits (90D), Top 10 OHLC Tracking, Daily Runs, plus
-   one dated sheet per run day). The three simulation sheets share one engine
+   IPOs/Earnings, Top 10 OHLC Tracking, Daily Runs, plus one dated sheet per
+   run day). The three simulation sheets share one engine
    (`build_investment_simulation_rows`, switched by `entry_session`) and differ
    only in entry fill: `regular` takes the next session's 9:30am open, `am` the
    next morning's 4:00-9:29am pre-market open, `pm` the rank date's own
@@ -119,7 +102,7 @@ better than -2%).
 - `POLYGON_API_KEY` — required for Polygon refresh + intraday target/stop
   simulation; never commit this, set it in the shell/scheduler.
 - `POLYGON_BOOTSTRAP_YEARS` (default 2), `POLYGON_BACKFILL_DAYS` (default 60),
-  `POLYGON_SPLIT_REPAIR_DAYS` (default 120), `POLYGON_RATE_LIMIT_SLEEP`
+  `POLYGON_RATE_LIMIT_SLEEP`
 - `STOOQ_SRC`, `STOOQ_MODE` (`copy`|`move`) — Stooq fallback, only used if
   `POLYGON_API_KEY` is unset
 - `SMTP_HOST/PORT/USERNAME/PASSWORD`, `EMAIL_FROM`, `EMAIL_TO`,
@@ -142,6 +125,13 @@ updated `results.xlsx` back to the repo as `github-actions[bot]`.
 - No automated test suite exists. Sanity-check changes to `screen_stooq.py`
   by running `--run_mode single --single_symbol <TICKER>` against existing
   `data 2` before running the full universe.
+- Splits are deliberately not tracked or repaired. Polygon's adjusted bars are
+  adjusted as of the request and the backfill only rewrites the last
+  `POLYGON_BACKFILL_DAYS`, so a split leaves a price seam at the window edge in
+  that symbol's file. Anything level-based across the seam (52-week and
+  multi-year highs, RSI/MACD, average dollar volume, beta, the daily OHLC exit
+  scan) is wrong for that symbol until a `--bootstrap --replace-existing`
+  rebuild. `validate_price_data.py` still flags the resulting price jumps.
 - `--as_of_date` is a real cutoff: `load_series_from_file`,
   `scan_all_time_high` and `load_ohlc_from_file` all drop rows past it, so a
   historical replay sees only the data that existed then. Any new file reader

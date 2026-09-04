@@ -532,7 +532,6 @@ NASDAQ_HEADERS = {
 ALPHAVANTAGE_IPO_URL = "https://www.alphavantage.co/query"
 ALPHAVANTAGE_API_KEY = "F7HUZ9ETATI052FB"
 POLYGON_AGGS_URL = "https://api.polygon.io/v2/aggs/ticker/{ticker}/range/{multiplier}/{timespan}/{from_date}/{to_date}"
-POLYGON_SPLITS_URL = "https://api.polygon.io/stocks/v1/splits"
 EASTERN_TZ = ZoneInfo("America/New_York")
 MARKET_REGIME_SPY = "SPY.US"
 MARKET_REGIME_QQQ = "QQQ.US"
@@ -544,7 +543,10 @@ MARKET_REGIME_MOMENTUM_DAYS = 5
 MARKET_REGIME_SPY_MIN_5D_RETURN = -0.02
 MARKET_REGIME_MODES = ("standard", "aggressive")
 HOW_IT_WORKS_SHEET_NAME = "How It Works"
-RECENT_SPLITS_SHEET_NAME = "Recent Splits (90D)"
+# Legacy tab from when splits were tracked. The name survives only so the
+# orphaned sheet is deleted from workbooks that still carry it: an
+# unrecognized sheet is read as the ranked stock list by send_daily_email.py.
+LEGACY_SPLITS_SHEET_NAME = "Recent Splits (90D)"
 UPCOMING_IPOS_SHEET_NAME = "Upcoming IPOs (60D)"
 UPCOMING_EARNINGS_SHEET_NAME = "Upcoming Earnings (14D)"
 TOP10_OHLC_SHEET_NAME = "Top 10 OHLC Tracking"
@@ -574,7 +576,6 @@ TOP10_OHLC_TRAILING_HIDDEN_COLUMNS = ("R",)
 PROTECTED_SHEET_NAMES = {
     "Single Tickers",
     HOW_IT_WORKS_SHEET_NAME,
-    RECENT_SPLITS_SHEET_NAME,
     UPCOMING_IPOS_SHEET_NAME,
     UPCOMING_EARNINGS_SHEET_NAME,
     TOP10_OHLC_SHEET_NAME,
@@ -702,141 +703,6 @@ def fetch_nasdaq_earnings_dates(
             "name": company_names.get(sym, ""),
         }
     return out
-
-
-def fetch_polygon_splits_since(
-    api_key: str,
-    session: requests.Session,
-    since: date,
-    tracked: set[str],
-) -> list[dict[str, Any]]:
-    """
-    Every split in the tracked universe executed on or after `since`.
-
-    Queried without a ticker filter so a split is caught wherever it happens,
-    not only in symbols that ranked that day, then narrowed to tracked symbols
-    locally. Returns [] when no key is configured.
-    """
-    api_key = (api_key or "").strip()
-    if not api_key:
-        return []
-
-    rows: list[dict[str, Any]] = []
-    params: dict[str, Any] = {
-        "execution_date.gte": since.isoformat(),
-        "sort": "execution_date.desc",
-        "limit": 1000,
-        "apiKey": api_key,
-    }
-    url: str | None = POLYGON_SPLITS_URL
-
-    try:
-        while url:
-            resp = session.get(url, params=params, timeout=30)
-            resp.raise_for_status()
-            payload = resp.json()
-            for row in payload.get("results") or []:
-                symbol = str(row.get("ticker") or "").strip().upper()
-                if not symbol or (tracked and symbol not in tracked):
-                    continue
-                try:
-                    executed = datetime.strptime(
-                        str(row.get("execution_date")), "%Y-%m-%d"
-                    ).date()
-                except (TypeError, ValueError):
-                    continue
-                split_from = row.get("split_from")
-                split_to = row.get("split_to")
-                rows.append(
-                    {
-                        "symbol": symbol,
-                        "execution_date": executed,
-                        "ratio": (
-                            ""
-                            if split_from in (None, "") or split_to in (None, "")
-                            else f"{_trim_split_leg(split_from)}:{_trim_split_leg(split_to)}"
-                        ),
-                        "adjustment_type": str(row.get("adjustment_type") or "").replace("_", " "),
-                    }
-                )
-            url = payload.get("next_url") or None
-            params = {"apiKey": api_key}
-    except (requests.RequestException, ValueError) as exc:
-        print(f"Warning: could not fetch recent splits from Polygon ({exc}).")
-
-    rows.sort(key=lambda r: (r["execution_date"], r["symbol"]), reverse=True)
-    return rows
-
-
-def write_recent_splits_sheet(
-    wb: Workbook,
-    split_rows: list[dict[str, Any]],
-    start_date: date,
-    end_date: date,
-    have_api_key: bool,
-) -> None:
-    """
-    Create or replace a workbook tab listing splits in the tracked universe.
-
-    Anything listed here is a symbol whose stored history predates the split and
-    is therefore still on the old per-share basis until it is rescaled.
-    """
-    sheet_name = RECENT_SPLITS_SHEET_NAME
-    if sheet_name in wb.sheetnames:
-        ws = wb[sheet_name]
-        for rng in list(ws.merged_cells.ranges):
-            ws.unmerge_cells(str(rng))
-        if ws.max_row > 0:
-            ws.delete_rows(1, ws.max_row)
-    else:
-        ws = wb.create_sheet(title=sheet_name)
-
-    ws.append([f"Splits in tracked symbols from {start_date.isoformat()} to {end_date.isoformat()}"])
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=5)
-    ws["A1"].font = Font(name="Calibri", size=13, bold=True, color=Color(indexed=9))
-    ws["A1"].alignment = Alignment(horizontal="left", vertical="center")
-    ws["A1"].fill = PatternFill(fill_type="solid", fgColor=Color(indexed=8))
-
-    headers = ["Symbol", "Split Date", "From:To", "Type", "Action Needed"]
-    ws.append(headers)
-    ws.row_dimensions[1].height = 50.85
-    ws.row_dimensions[2].height = 34.85
-    descriptor_fill = PatternFill(fill_type="solid", fgColor=Color(indexed=9))
-    descriptor_font = Font(name="Calibri", size=11, bold=True, italic=True, color=Color(indexed=8))
-    descriptor_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    thin_red = Side(style="thin", color=Color(indexed=10))
-    thick_black = Side(style="thick", color=Color(indexed=8))
-
-    for col_idx in range(1, len(headers) + 1):
-        cell = ws.cell(row=2, column=col_idx)
-        cell.fill = descriptor_fill
-        cell.font = descriptor_font
-        cell.alignment = descriptor_align
-        cell.border = Border(
-            left=thin_red if col_idx == 1 else thick_black,
-            right=thick_black,
-        )
-
-    if split_rows:
-        for row in split_rows:
-            ws.append(
-                [
-                    row.get("symbol", ""),
-                    row.get("execution_date"),
-                    row.get("ratio", ""),
-                    row.get("adjustment_type", ""),
-                    f"Rescale price history before {row['execution_date'].isoformat()}",
-                ]
-            )
-    elif not have_api_key:
-        ws.append(["POLYGON_API_KEY not set, so splits could not be checked.", "", "", "", ""])
-    else:
-        ws.append(["No splits in tracked symbols in this date range.", "", "", "", ""])
-
-    for row_idx in range(3, ws.max_row + 1):
-        ws.cell(row=row_idx, column=2).number_format = "mmm d, yyyy"
-
-    auto_size_columns(ws, min_width=10, max_width=45)
 
 
 def write_commit_summary_sheet(wb: Workbook, limit: int = 200) -> None:
@@ -1199,13 +1065,6 @@ def write_how_it_works_sheet(wb: Workbook, args: Any, avg_vol_mode: str) -> None
             "New listings expected in the next 60 days. Informational only, they have no price "
             "history to screen.",
         ),
-        (
-            "row",
-            RECENT_SPLITS_SHEET_NAME,
-            "Stock splits in the last 90 days. A split changes the share price without changing "
-            "the company's value, so older stored prices for that stock are misleading until "
-            "they are rescaled.",
-        ),
         ("gap", "", ""),
         ("head", "Reading the Daily Runs columns", ""),
         ("row", "Symbol / Company", "Ticker and shortened company name."),
@@ -1344,17 +1203,6 @@ def write_how_it_works_sheet(wb: Workbook, args: Any, avg_vol_mode: str) -> None
         ws.row_dimensions[row_idx].height = wrapped_height(text, label_width + body_width)
 
     ws.sheet_view.showGridLines = False
-
-
-def _trim_split_leg(value: Any) -> str:
-    """Render a split ratio leg without a trailing '.0' (4.0 -> '4')."""
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return str(value)
-    if number.is_integer():
-        return str(int(number))
-    return f"{number:g}"
 
 
 def fetch_nasdaq_upcoming_earnings(
@@ -3326,7 +3174,11 @@ def write_investment_dashboard_sheet(
 
 
 def remove_inactive_report_sheets(wb: Workbook) -> None:
-    for sheet_name in (TOP10_OHLC_SHEET_NAME, INVESTMENT_DASHBOARD_SHEET_NAME):
+    for sheet_name in (
+        TOP10_OHLC_SHEET_NAME,
+        INVESTMENT_DASHBOARD_SHEET_NAME,
+        LEGACY_SPLITS_SHEET_NAME,
+    ):
         if sheet_name in wb.sheetnames:
             wb.remove(wb[sheet_name])
 
@@ -3985,12 +3837,6 @@ def main() -> None:
         help="Alpha Vantage API key (defaults to hardcoded project key).",
     )
     ap.add_argument(
-        "--splits_lookback_days",
-        type=int,
-        default=90,
-        help="How far back the Recent Splits sheet looks (default: 90).",
-    )
-    ap.add_argument(
         "--polygon_api_key",
         default=os.environ.get("POLYGON_API_KEY", ""),
         help="Polygon API key for 1-minute investment dashboard exits. Defaults to POLYGON_API_KEY.",
@@ -4491,27 +4337,6 @@ def main() -> None:
             key=lambda r: str(r.get("symbol", "")).strip().upper(),
         )[: args.daily_limit]
 
-    splits_session = requests.Session()
-
-    # Universe-wide sweep: a split corrupts a symbol's stored history whether or
-    # not that symbol ranked today, so this is not limited to reported rows.
-    splits_start = data_date - timedelta(days=args.splits_lookback_days)
-    tracked_symbols = {
-        display_symbol(sym).upper()
-        for sym in (symbol_paths.keys() if symbol_paths else [t for t in tickers])
-    }
-    if run_mode == "single":
-        tracked_symbols = {display_symbol(single_symbol).upper()}
-    write_recent_splits_sheet(
-        wb,
-        fetch_polygon_splits_since(
-            args.polygon_api_key, splits_session, splits_start, tracked_symbols
-        ),
-        splits_start,
-        data_date,
-        have_api_key=bool(args.polygon_api_key.strip()),
-    )
-
     qualified_dates = collect_qualified_result_dates(
         wb,
         current_results=daily_output_rows if run_mode == "all" else None,
@@ -4671,6 +4496,10 @@ def main() -> None:
         earnings_rows = fetch_nasdaq_upcoming_earnings(session, earnings_start, earnings_end)
         write_upcoming_earnings_sheet(wb, earnings_rows, earnings_start, earnings_end, qualified_dates)
         write_how_it_works_sheet(wb, args, avg_vol_mode)
+        # Single mode saves the same workbook the full run does, so it has to
+        # drop retired tabs too -- otherwise it can hand send_daily_email.py a
+        # workbook still carrying one.
+        remove_inactive_report_sheets(wb)
         auto_size_columns(ws)
         wb.save(out_path)
         print(f"Wrote single ticker to {out_path} (Single Tickers)")
