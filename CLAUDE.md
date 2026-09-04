@@ -125,6 +125,23 @@ updated `results.xlsx` back to the repo as `github-actions[bot]`.
 - No automated test suite exists. Sanity-check changes to `screen_stooq.py`
   by running `--run_mode single --single_symbol <TICKER>` against existing
   `data 2` before running the full universe.
+- The daily backfill collects every day's grouped bars in memory first and
+  writes each symbol's file **once** (`group_bars_by_path` → `flush_pending_rows`).
+  The old per-day `upsert_daily_row` path rewrote a whole file to change one
+  row, so 60 days x ~5,500 files meant ~330,000 read-modify-write cycles per
+  run; batching made it ~85x faster. `upsert_daily_row` is still used for the
+  single-date refresh, where there is nothing to batch.
+- Simulation rows that already resolved are reused rather than recomputed.
+  `load_settled_simulation_rows` reads back rows whose exit date precedes the
+  run, and `build_investment_simulation_rows` emits them before touching a file
+  or Polygon. Cohorts are never retired, so without this the per-run cost grows
+  every trading day; it takes the simulation from ~1,600 Polygon requests to
+  ~10. The three sessions also share one `ohlc_cache`/`intraday_cache`.
+  A reused row keeps the answer it was built with, so **after changing the
+  entry/exit thresholds or `--market_regime_mode`, rerun with
+  `--rebuild_simulation`** or the sheets will mix old and new assumptions.
+  The stored market-condition text round-trips verbatim as `cached_condition`,
+  which is what keeps the `SUMIF(..., "Good*", ...)` totals unchanged.
 - Splits are deliberately not tracked or repaired. Polygon's adjusted bars are
   adjusted as of the request and the backfill only rewrites the last
   `POLYGON_BACKFILL_DAYS`, so a split leaves a price seam at the window edge in

@@ -628,6 +628,101 @@ def upsert_daily_row(path: Path, new_row: str, date_int: int, dry_run: bool) -> 
     return action
 
 
+def upsert_symbol_rows(
+    path: Path,
+    new_rows: dict[int, str],
+    dry_run: bool,
+) -> dict[str, int]:
+    """
+    Merge many dated rows into one file with a single read and a single write.
+
+    upsert_daily_row rewrites a whole file to change one row, so calling it per
+    symbol per trading day made a 60-day backfill rebuild every file in the
+    universe 60 times -- hundreds of thousands of read-modify-write cycles for
+    an update that touches one line each. Batching by symbol makes that one pass.
+    """
+    counts = {"added": 0, "updated": 0, "unchanged": 0}
+    header_lines: list[str] = []
+    rows: dict[int, str] = {}
+    if path.exists():
+        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            date_int = row_date(line)
+            if date_int is None:
+                header_lines.append(line)
+            else:
+                rows[date_int] = line
+    else:
+        header_lines = [STOOQ_HEADER]
+
+    changed = False
+    for date_int, new_row in new_rows.items():
+        existing = rows.get(date_int)
+        if existing == new_row:
+            counts["unchanged"] += 1
+            continue
+        counts["added" if existing is None else "updated"] += 1
+        rows[date_int] = new_row
+        changed = True
+
+    if changed and not dry_run:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        out = header_lines + [rows[key] for key in sorted(rows)]
+        path.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+    return counts
+
+
+def group_bars_by_path(
+    bars: list[dict[str, Any]],
+    trading_date: date,
+    symbol_paths: dict[str, Path],
+    new_symbols_dir: Path | None,
+    pending: dict[Path, dict[int, str]],
+) -> int:
+    """
+    Accumulate one day's bars into per-symbol row maps. Returns the skipped count.
+
+    Nothing is written here; the caller collects every day it wants first and
+    flushes once, so each file is opened a single time.
+    """
+    date_int = int(trading_date.strftime("%Y%m%d"))
+    skipped = 0
+    for bar in bars:
+        raw_symbol = str(bar.get("T") or "").strip()
+        if not raw_symbol:
+            skipped += 1
+            continue
+
+        symbol = normalize_polygon_symbol(raw_symbol)
+        path = symbol_paths.get(symbol)
+        if path is None:
+            if new_symbols_dir is None:
+                skipped += 1
+                continue
+            path = new_symbols_dir / symbol_to_file_name(symbol)
+
+        try:
+            row = stooq_row(symbol, trading_date, bar)
+        except KeyError:
+            skipped += 1
+            continue
+
+        pending.setdefault(path, {})[date_int] = row
+
+    return skipped
+
+
+def flush_pending_rows(
+    pending: dict[Path, dict[int, str]],
+    dry_run: bool,
+) -> dict[str, int]:
+    total = {"added": 0, "updated": 0, "unchanged": 0}
+    for path, rows in pending.items():
+        for key, value in upsert_symbol_rows(path, rows, dry_run).items():
+            total[key] += value
+    return total
+
+
 def upsert_grouped_bars(
     bars: list[dict[str, Any]],
     trading_date: date,
@@ -635,31 +730,10 @@ def upsert_grouped_bars(
     new_symbols_dir: Path | None,
     dry_run: bool,
 ) -> dict[str, int]:
-    date_int = int(trading_date.strftime("%Y%m%d"))
-    counts = {"added": 0, "updated": 0, "unchanged": 0, "skipped": 0}
-    for bar in bars:
-        raw_symbol = str(bar.get("T") or "").strip()
-        if not raw_symbol:
-            counts["skipped"] += 1
-            continue
-
-        symbol = normalize_polygon_symbol(raw_symbol)
-        path = symbol_paths.get(symbol)
-        if path is None:
-            if new_symbols_dir is None:
-                counts["skipped"] += 1
-                continue
-            path = new_symbols_dir / symbol_to_file_name(symbol)
-
-        try:
-            row = stooq_row(symbol, trading_date, bar)
-        except KeyError:
-            counts["skipped"] += 1
-            continue
-
-        action = upsert_daily_row(path, row, date_int, dry_run=dry_run)
-        counts[action] += 1
-
+    pending: dict[Path, dict[int, str]] = {}
+    skipped = group_bars_by_path(bars, trading_date, symbol_paths, new_symbols_dir, pending)
+    counts = flush_pending_rows(pending, dry_run)
+    counts["skipped"] = skipped
     return counts
 
 
@@ -681,6 +755,9 @@ def backfill_recent_days(args: argparse.Namespace, root: Path, new_symbols_dir: 
         f"to {dates[-1].isoformat()} ({len(dates)} weekdays)."
     )
 
+    # Every day is collected before anything is written, so each symbol's file is
+    # read and rewritten once for the whole window rather than once per day.
+    pending: dict[Path, dict[int, str]] = {}
     for idx, trading_date in enumerate(dates, start=1):
         bars = fetch_grouped_daily_with_retries(
             api_key,
@@ -693,24 +770,21 @@ def backfill_recent_days(args: argparse.Namespace, root: Path, new_symbols_dir: 
             total["no_data"] += 1
             print(f"[{idx}/{len(dates)}] {trading_date.isoformat()}: no data")
             continue
-        counts = upsert_grouped_bars(
-            bars,
-            trading_date,
-            symbol_paths=symbol_paths,
-            new_symbols_dir=new_symbols_dir,
-            dry_run=args.dry_run,
+        total["skipped"] += group_bars_by_path(
+            bars, trading_date, symbol_paths, new_symbols_dir, pending
         )
-        merge_counts(total, counts)
         print(
             f"[{idx}/{len(dates)}] {trading_date.isoformat()}: "
-            f"added={counts['added']}, updated={counts['updated']}, "
-            f"unchanged={counts['unchanged']}, skipped_new_or_invalid={counts['skipped']}"
+            f"bars={len(bars)}, queued={sum(len(v) for v in pending.values()):,}"
         )
+
+    print(f"{mode}Writing {len(pending):,} symbol files...")
+    merge_counts(total, flush_pending_rows(pending, args.dry_run))
 
     print(
         f"{mode}Backfill complete -> added={total['added']}, updated={total['updated']}, "
         f"unchanged={total['unchanged']}, skipped_new_or_invalid={total['skipped']}, "
-        f"days_no_data={total['no_data']}"
+        f"days_no_data={total['no_data']}, files_written={len(pending):,}"
     )
 
 

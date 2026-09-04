@@ -2306,6 +2306,78 @@ def evaluate_market_regime(
     return metrics
 
 
+def load_settled_simulation_rows(
+    wb: Workbook,
+    sheet_name: str,
+    as_of: date,
+) -> dict[tuple[date, str], dict[str, Any]]:
+    """
+    Recover rows from a previous run whose trade has already resolved.
+
+    A row that exited before `as_of` is settled history: the entry filled, the
+    exit hit, and both prices are in the past. Recomputing it re-reads the daily
+    file and refetches Polygon minute bars only to arrive at the same answer --
+    and because cohorts are never retired, that cost grows every trading day.
+
+    Only rows with an exit strictly before `as_of` are reused, so anything still
+    open, still pending, or resolved today is left to be recomputed. The stored
+    market-condition text is carried across verbatim as `cached_condition`, which
+    is what keeps the sheet's SUMIF(..., "Good*", ...) totals identical.
+
+    Reusing a settled row also means a later restatement of the underlying bars
+    is not picked up. That is the same trade-off the pipeline already makes by
+    not tracking splits.
+    """
+    if sheet_name not in wb.sheetnames:
+        return {}
+    ws = wb[sheet_name]
+    headers = [" ".join(str(cell.value or "").split()).lower() for cell in ws[1]]
+
+    def col(name: str) -> int | None:
+        return headers.index(name) if name in headers else None
+
+    idx = {key: col(key) for key in (
+        "symbol", "rank date", "entry date", "entry price", "entry time",
+        "exit date", "exit time", "exit price", "result $", "result %",
+        f"{VARIANCE_LOOKBACK_MONTHS}m daily variance", "spy - market condition",
+    )}
+    if idx["symbol"] is None or idx["rank date"] is None or idx["exit date"] is None:
+        return {}
+
+    def get(row: tuple[Any, ...], key: str) -> Any:
+        i = idx[key]
+        return row[i] if i is not None and i < len(row) else None
+
+    out: dict[tuple[date, str], dict[str, Any]] = {}
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        symbol = str(get(row, "symbol") or "").strip().upper()
+        rank_date = _coerce_date(get(row, "rank date"))
+        exit_date = _coerce_date(get(row, "exit date"))
+        if not symbol or rank_date is None or exit_date is None or exit_date >= as_of:
+            continue
+        out[(rank_date, symbol)] = {
+            "rank_date": rank_date,
+            "symbol": symbol,
+            "entry_date": _coerce_date(get(row, "entry date")),
+            "entry_time": get(row, "entry time") or "",
+            "entry_price": _coerce_float(get(row, "entry price")),
+            "exit_date": exit_date,
+            "exit_time": get(row, "exit time") or "",
+            "exit_price": _coerce_float(get(row, "exit price")),
+            "result_currency": _coerce_float(get(row, "result $")),
+            "result_pct": _coerce_float(get(row, "result %")),
+            "variance_4m": _coerce_float(
+                get(row, f"{VARIANCE_LOOKBACK_MONTHS}m daily variance")
+            ),
+            "cached_condition": get(row, "spy - market condition"),
+            # Only used when the sheet carries no condition column.
+            "status": "Closed",
+            "market_reason": "",
+            "entry_fallback_reason": "",
+        }
+    return out
+
+
 def build_investment_simulation_rows(
     cohorts: list[dict[str, Any]],
     symbol_paths: dict[str, Path],
@@ -2319,10 +2391,16 @@ def build_investment_simulation_rows(
     market_regimes: dict[date, dict[str, Any]] | None = None,
     entry_session: str = "regular",
     run_finish_times: dict[date, datetime] | None = None,
+    settled: dict[tuple[date, str], dict[str, Any]] | None = None,
+    ohlc_cache: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] | None = None,
+    intraday_cache: dict[tuple[str, date, date, str], list[dict[str, Any]]] | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    ohlc_cache: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
-    intraday_cache: dict[tuple[str, date, date, str], list[dict[str, Any]]] = {}
+    # The three sessions read overlapping ranges of the same files, so the caller
+    # passes one pair of caches for all of them rather than paying three times.
+    ohlc_cache = {} if ohlc_cache is None else ohlc_cache
+    intraday_cache = {} if intraday_cache is None else intraday_cache
+    settled = settled or {}
     market_series = _market_symbol_series(MARKET_REGIME_SPY, symbol_paths, root, ohlc_cache)
     market_dates = market_series[0] if market_series is not None else np.array([], dtype=np.int32)
     run_finish_times = run_finish_times or {}
@@ -2542,6 +2620,15 @@ def build_investment_simulation_rows(
         normalized = normalize_symbol(symbol)
         rank_date = cohort["rank_date"]
         market_regime = (market_regimes or {}).get(rank_date, {})
+
+        # A resolved row is settled history. Reusing it skips the daily-file read
+        # and every Polygon request this cohort would otherwise repeat, which is
+        # what stops the per-run cost growing with the length of the record.
+        cached = settled.get((rank_date, symbol))
+        if cached is not None:
+            rows.append({**cached, "rank": int(cohort["rank"])})
+            continue
+
         if entry_session == "pm":
             # A PM entry fills in the rank date's own after-hours session, so unlike
             # the other sessions it never waits for the next trading day.
@@ -3192,6 +3279,7 @@ def write_summary_only_sheet(
     polygon_api_key: str = "",
     intraday_exit_source: str = "auto",
     market_regime_mode: str = MARKET_REGIME_DEFAULT_MODE,
+    reuse_settled: bool = True,
 ) -> None:
     cohorts = collect_top_ranked_cohorts(wb, top_n=top_n)
     market_cache: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
@@ -3199,6 +3287,18 @@ def write_summary_only_sheet(
         rank_date: evaluate_market_regime(rank_date, symbol_paths, root, market_cache, mode=market_regime_mode)
         for rank_date in {cohort["rank_date"] for cohort in cohorts}
     }
+    # Rows that already resolved are read back from the sheets this run is about
+    # to rewrite, so only open, pending and brand-new cohorts are recomputed.
+    # The caches are shared across all three sessions, whose date ranges overlap.
+    as_of = date_from_int(AS_OF_DATE_INT) if AS_OF_DATE_INT is not None else date.today()
+    settled_by_sheet = {
+        name: load_settled_simulation_rows(wb, name, as_of) if reuse_settled else {}
+        for name in (SUMMARY_SHEET_NAME, AM_SIMULATION_SHEET_NAME, PM_SIMULATION_SHEET_NAME)
+    }
+    ohlc_cache: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
+    intraday_cache: dict[tuple[str, date, date, str], list[dict[str, Any]]] = {}
+    shared = {"ohlc_cache": ohlc_cache, "intraday_cache": intraday_cache}
+
     simulation_rows = build_investment_simulation_rows(
         cohorts,
         symbol_paths,
@@ -3207,6 +3307,8 @@ def write_summary_only_sheet(
         polygon_api_key=polygon_api_key,
         intraday_exit_source=intraday_exit_source,
         market_regimes=market_regimes,
+        settled=settled_by_sheet[SUMMARY_SHEET_NAME],
+        **shared,
     )
     write_summary_sheet(wb, simulation_rows, include_market_status=True)
 
@@ -3219,6 +3321,8 @@ def write_summary_only_sheet(
         intraday_exit_source=intraday_exit_source,
         market_regimes=market_regimes,
         entry_session="am",
+        settled=settled_by_sheet[AM_SIMULATION_SHEET_NAME],
+        **shared,
     )
     write_summary_sheet(
         wb,
@@ -3238,6 +3342,8 @@ def write_summary_only_sheet(
         market_regimes=market_regimes,
         entry_session="pm",
         run_finish_times=collect_run_finish_times(wb),
+        settled=settled_by_sheet[PM_SIMULATION_SHEET_NAME],
+        **shared,
     )
     write_summary_sheet(
         wb,
@@ -3340,7 +3446,12 @@ def write_summary_sheet(
         if include_variance:
             output_row.append(row.get("variance_4m"))
         if include_market_status:
-            if status in {"Blocked", "Ignored", "Excluded", "Pending"}:
+            cached_condition = row.get("cached_condition")
+            if cached_condition is not None:
+                # Reused row: the stored text already decided which side of the
+                # "Good*" filter it fell on, so it must round-trip unchanged.
+                condition = cached_condition
+            elif status in {"Blocked", "Ignored", "Excluded", "Pending"}:
                 condition = row.get("market_reason") or row.get("exit_reason")
             else:
                 condition = row.get("entry_fallback_reason") or "Good"
@@ -3846,6 +3957,16 @@ def main() -> None:
         choices=["auto", "polygon", "daily"],
         default="auto",
         help="Dashboard exit data source: auto/polygon uses Polygon 1-minute bars when a key is available; daily uses daily OHLC.",
+    )
+    ap.add_argument(
+        "--rebuild_simulation",
+        action="store_true",
+        help=(
+            "Recompute every simulation row instead of reusing rows that already "
+            "resolved on an earlier run. Needed after changing the entry/exit "
+            "thresholds or --market_regime_mode, since a reused row keeps the "
+            "answer it was built with."
+        ),
     )
     ap.add_argument(
         "--market_regime_mode",
@@ -4780,6 +4901,7 @@ def main() -> None:
         polygon_api_key=args.polygon_api_key.strip(),
         intraday_exit_source=args.intraday_exit_source,
         market_regime_mode=args.market_regime_mode,
+        reuse_settled=not args.rebuild_simulation,
     )
     write_how_it_works_sheet(wb, args, avg_vol_mode)
     write_commit_summary_sheet(wb)
