@@ -1,0 +1,50 @@
+# GitLab pipeline for the daily screener.
+#
+# GitHub Actions reads only .github/workflows/ and GitLab reads only this file,
+# so both configs live in the same commit and each host screens its own universe
+# from identical source. This one covers NYSE + NASDAQ; the GitHub workflow pins
+# SCREEN_UNIVERSE to nyse.
+#
+# Required CI/CD variables (Settings > CI/CD > Variables), all masked:
+#   POLYGON_API_KEY, SMTP_HOST, SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD,
+#   EMAIL_FROM, EMAIL_TO
+
+stages:
+  - screen
+
+daily-screener:
+  stage: screen
+  image: python:3.12
+  # 4:30 PM America/New_York. GitLab schedules carry their own timezone, set on
+  # the schedule itself (Build > Pipeline schedules), not here.
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web"
+  variables:
+    SCREEN_UNIVERSE: "us"
+    POLYGON_BOOTSTRAP_YEARS: "2"
+    POLYGON_BACKFILL_DAYS: "60"
+    POLYGON_RATE_LIMIT_SLEEP: "0"
+    SKIP_PIP_INSTALL: "1"
+    EMAIL_SUBJECT_PREFIX: "Daily Screener"
+    EMAIL_ATTACH_RESULTS: "true"
+  cache:
+    # Price history is large and regenerable; keeping it across runs is what
+    # avoids a full re-bootstrap every night.
+    key: polygon-data
+    paths:
+      - "data 2/"
+  before_script:
+    - python -m pip install --quiet -r requirements.txt
+    - |
+      if [ -z "$POLYGON_API_KEY" ]; then
+        echo "POLYGON_API_KEY CI/CD variable is missing or empty."
+        exit 1
+      fi
+  script:
+    - bash ./run_daily.sh
+    - python send_daily_email.py
+  artifacts:
+    paths:
+      - results.xlsx
+    expire_in: 30 days

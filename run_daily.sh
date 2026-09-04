@@ -29,6 +29,15 @@ TICKERS_FILE="$PROJECT_DIR/us_tickers.csv"
 RESULTS_FILE="$PROJECT_DIR/results.xlsx"
 ROOT_DATA="$PROJECT_DIR/data 2/daily/us"
 BENCHMARK="SPY.US"
+# Which listing venues to screen: "us" (NYSE + NASDAQ), "nyse", "nasdaq" or
+# "all". The CI config for each host pins its own value, so the same code
+# screens a different universe on each remote without the source diverging.
+SCREEN_UNIVERSE="${SCREEN_UNIVERSE:-us}"
+case "$SCREEN_UNIVERSE" in
+  nyse)   TICKER_DIRS=("$ROOT_DATA/nyse stocks") ;;
+  nasdaq) TICKER_DIRS=("$ROOT_DATA/nasdaq stocks") ;;
+  *)      TICKER_DIRS=("$ROOT_DATA/nyse stocks" "$ROOT_DATA/nasdaq stocks") ;;
+esac
 POLYGON_BOOTSTRAP_YEARS="${POLYGON_BOOTSTRAP_YEARS:-2}"
 POLYGON_BACKFILL_DAYS="${POLYGON_BACKFILL_DAYS:-60}"
 
@@ -43,8 +52,9 @@ fi
 if [ -n "${POLYGON_API_KEY:-}" ]; then
   if [ ! -d "$ROOT_DATA/nyse stocks" ]; then
     echo "Stock data folders missing; bootstrapping ${POLYGON_BOOTSTRAP_YEARS} years from Polygon."
-    $PYTHON_CMD refresh_polygon_daily.py --bootstrap --include-today --root "$ROOT_DATA" --bootstrap-years "$POLYGON_BOOTSTRAP_YEARS"
-  elif [ ! -d "$ROOT_DATA/nasdaq stocks" ]; then
+    $PYTHON_CMD refresh_polygon_daily.py --bootstrap --include-today --root "$ROOT_DATA" \
+      --bootstrap-years "$POLYGON_BOOTSTRAP_YEARS" --bootstrap-universe "$SCREEN_UNIVERSE"
+  elif [ "$SCREEN_UNIVERSE" != "nyse" ] && [ ! -d "$ROOT_DATA/nasdaq stocks" ]; then
     # The daily backfill only touches symbols that already have a file, so it
     # cannot introduce NASDAQ on its own. Keep screening NYSE rather than firing
     # a bootstrap that would abort on the existing data, and say what is needed.
@@ -64,7 +74,8 @@ if [ "${SKIP_PIP_INSTALL:-0}" != "1" ] && [ -f "requirements.txt" ]; then
   $PYTHON_CMD -m pip install -r "requirements.txt"
 fi
 
-$PYTHON_CMD generate_tickers.py --dir "$ROOT_DATA/nyse stocks" "$ROOT_DATA/nasdaq stocks" --out "$TICKERS_FILE"
+echo "Screening universe: $SCREEN_UNIVERSE"
+$PYTHON_CMD generate_tickers.py --dir "${TICKER_DIRS[@]}" --out "$TICKERS_FILE"
 
 $PYTHON_CMD screen_stooq.py --run_mode all --tickers "$TICKERS_FILE" --root "$ROOT_DATA" --benchmark "$BENCHMARK" --out "$RESULTS_FILE"
 

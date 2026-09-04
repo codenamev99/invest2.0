@@ -33,6 +33,15 @@ set "TICKERS_FILE=%PROJECT_DIR%us_tickers.csv"
 set "RESULTS_FILE=%PROJECT_DIR%results.xlsx"
 set "ROOT_DATA=%PROJECT_DIR%data 2\daily\us"
 set "BENCHMARK=SPY.US"
+rem Which listing venues to screen: us (NYSE + NASDAQ), nyse, nasdaq or all.
+if "%SCREEN_UNIVERSE%"=="" set "SCREEN_UNIVERSE=us"
+if /i "%SCREEN_UNIVERSE%"=="nyse" (
+    set "TICKER_DIRS="%ROOT_DATA%\nyse stocks""
+) else if /i "%SCREEN_UNIVERSE%"=="nasdaq" (
+    set "TICKER_DIRS="%ROOT_DATA%\nasdaq stocks""
+) else (
+    set "TICKER_DIRS="%ROOT_DATA%\nyse stocks" "%ROOT_DATA%\nasdaq stocks""
+)
 if "%POLYGON_BOOTSTRAP_YEARS%"=="" set "POLYGON_BOOTSTRAP_YEARS=2"
 if "%POLYGON_BACKFILL_DAYS%"=="" set "POLYGON_BACKFILL_DAYS=60"
 
@@ -40,7 +49,7 @@ rem -------- Daily Steps --------
 if not "%POLYGON_API_KEY%"=="" (
     if not exist "%ROOT_DATA%\nyse stocks" (
         echo Stock data folders missing; bootstrapping %POLYGON_BOOTSTRAP_YEARS% years from Polygon.
-        %PYTHON_CMD% refresh_polygon_daily.py --bootstrap --include-today --root "%ROOT_DATA%" --bootstrap-years "%POLYGON_BOOTSTRAP_YEARS%"
+        %PYTHON_CMD% refresh_polygon_daily.py --bootstrap --include-today --root "%ROOT_DATA%" --bootstrap-years "%POLYGON_BOOTSTRAP_YEARS%" --bootstrap-universe "%SCREEN_UNIVERSE%"
         if errorlevel 1 (
             echo ERROR: Polygon bootstrap failed. Check POLYGON_API_KEY, plan history, and rate limits.
             exit /b 1
@@ -74,13 +83,14 @@ if not exist "%ROOT_DATA%\nyse stocks" (
     exit /b 1
 )
 
-if not exist "%ROOT_DATA%\nasdaq stocks" (
+if /i not "%SCREEN_UNIVERSE%"=="nyse" if not exist "%ROOT_DATA%\nasdaq stocks" (
     echo NOTE: no "%ROOT_DATA%\nasdaq stocks" folder; screening NYSE only.
     echo       To add NASDAQ history, run refresh_polygon_daily.py once with
     echo       --bootstrap --replace-existing.
 )
 
-%PYTHON_CMD% generate_tickers.py --dir "%ROOT_DATA%\nyse stocks" "%ROOT_DATA%\nasdaq stocks" --out "%TICKERS_FILE%"
+echo Screening universe: %SCREEN_UNIVERSE%
+%PYTHON_CMD% generate_tickers.py --dir %TICKER_DIRS% --out "%TICKERS_FILE%"
 if errorlevel 1 exit /b 1
 
 %PYTHON_CMD% screen_stooq.py --run_mode all --tickers "%TICKERS_FILE%" --root "%ROOT_DATA%" --benchmark "%BENCHMARK%" --out "%RESULTS_FILE%"

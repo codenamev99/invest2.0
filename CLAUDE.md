@@ -103,6 +103,9 @@ better than -2%).
   simulation; never commit this, set it in the shell/scheduler.
 - `POLYGON_BOOTSTRAP_YEARS` (default 2), `POLYGON_BACKFILL_DAYS` (default 60),
   `POLYGON_RATE_LIMIT_SLEEP`
+- `SCREEN_UNIVERSE` (`us` default, or `nyse`/`nasdaq`/`all`) — which listing
+  venues to screen. Read by both runners; it picks the `--bootstrap-universe`
+  and the folder list handed to `generate_tickers.py`.
 - `STOOQ_SRC`, `STOOQ_MODE` (`copy`|`move`) — Stooq fallback, only used if
   `POLYGON_API_KEY` is unset
 - `SMTP_HOST/PORT/USERNAME/PASSWORD`, `EMAIL_FROM`, `EMAIL_TO`,
@@ -110,10 +113,26 @@ better than -2%).
 
 ## Automation
 
+This project is pushed to two remotes running **identical source**, each
+screening a different universe:
+
+| remote | CI config | `SCREEN_UNIVERSE` |
+|---|---|---|
+| GitLab | `.gitlab-ci.yml` | `us` — NYSE + NASDAQ |
+| GitHub | `.github/workflows/daily-screener.yml` | `nyse` — NYSE only |
+
+GitHub Actions reads only `.github/workflows/`, GitLab only `.gitlab-ci.yml`, so
+both files live in the same commit and each host ignores the other's. **Keep the
+code venue-agnostic**: anything venue-specific belongs behind `SCREEN_UNIVERSE`,
+never in a branch that only one remote carries, or the two will drift.
+
 `.github/workflows/daily-screener.yml` runs on cron `30 16 * * 1-5` (4:30pm
 America/New_York, weekdays): checkout → Python 3.12 setup → install deps →
 restore `data 2` cache → run `run_daily.sh` → email results → commit the
-updated `results.xlsx` back to the repo as `github-actions[bot]`.
+updated `results.xlsx` back to the repo as `github-actions[bot]`. The GitLab
+pipeline runs the same steps on a schedule defined in the GitLab UI (its cron
+timezone lives on the schedule, not in the YAML) and keeps `results.xlsx` as a
+build artifact rather than committing it.
 
 ## Notes
 

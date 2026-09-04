@@ -53,6 +53,9 @@ jobs:
           POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
           POLYGON_BOOTSTRAP_YEARS: ${{ vars.POLYGON_BOOTSTRAP_YEARS || '2' }}
           POLYGON_BACKFILL_DAYS: ${{ vars.POLYGON_BACKFILL_DAYS || '60' }}
+          # This remote screens NYSE only. GitLab CI pins its own value, so the
+          # two hosts run different universes from identical source.
+          SCREEN_UNIVERSE: ${{ vars.SCREEN_UNIVERSE || 'nyse' }}
           SKIP_PIP_INSTALL: "1"
         run: bash ./run_daily.sh
 
