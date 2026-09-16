@@ -5,14 +5,21 @@ env:
 
 on:
   schedule:
-    # 4:30 PM Eastern time, Monday–Friday.
-    - cron: "30 16 * * 1-5"
+    # 8:15 PM Eastern time, Monday–Friday. Keep this in sync with the GitLab
+    # schedule (Build > Pipeline schedules there, since GitLab's cron lives on
+    # the schedule itself, not in .gitlab-ci.yml) — both hosts should always
+    # run at the same wall-clock time.
+    - cron: "15 20 * * 1-5"
       timezone: "America/New_York"
   workflow_dispatch:
 
 jobs:
   run-screener:
     runs-on: ubuntu-latest
+    # The first run has an empty cache, so it bootstraps POLYGON_BOOTSTRAP_YEARS
+    # of history for the whole US market before it screens anything. That run
+    # is far longer than a cached one and blows the 6-hour GitHub default.
+    timeout-minutes: 180
 
     permissions:
       contents: write
@@ -38,13 +45,34 @@ jobs:
           restore-keys: |
             polygon-data-${{ runner.os }}-
 
-      - name: Validate Polygon API key
+      # Says whether the cache came back. An empty count here on a run that is
+      # not the first means the cache did not restore and this run will
+      # re-bootstrap.
+      - name: Report cache status
+        run: |
+          echo "Cached price files: $(find 'data 2' -name '*.txt' 2>/dev/null | wc -l)"
+
+      # Check every credential up front. The screening run costs an hour of
+      # compute, so discovering a missing SMTP secret at the email step means
+      # paying for the whole run and still getting no email.
+      - name: Validate required secrets
         env:
           POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
         run: |
-          if [ -z "$POLYGON_API_KEY" ]; then
-            echo "POLYGON_API_KEY GitHub secret is missing or empty."
-            echo "Add it under Settings > Secrets and variables > Actions > Repository secrets."
+          missing=""
+          for var in POLYGON_API_KEY SMTP_HOST SMTP_USERNAME SMTP_PASSWORD EMAIL_TO; do
+            eval "value=\${$var:-}"
+            if [ -z "$value" ]; then
+              missing="$missing $var"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "Missing GitHub secret(s):$missing"
+            echo "Add them under Settings > Secrets and variables > Actions > Repository secrets."
             exit 1
           fi
 
@@ -72,6 +100,9 @@ jobs:
         run: python send_daily_email.py
 
       - name: Upload results artifact
+        # Keep the workbook even when the email step fails, so a bad SMTP
+        # setting can be diagnosed without re-running the screener.
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: screener-results

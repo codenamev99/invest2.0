@@ -2710,6 +2710,7 @@ def build_investment_simulation_rows(
             # do exist, but they are not the entry -- so it must not fall back to
             # them, or every run would book a placeholder into its own totals.
             is_current_run = rank_date == latest_rank_date
+            session_closed_fallback = False
             if finished_at is not None:
                 target_dt = finished_at + timedelta(minutes=PM_ENTRY_DELAY_MINUTES)
                 chosen_bar = next(
@@ -2720,6 +2721,16 @@ def build_investment_simulation_rows(
                     ),
                     None,
                 )
+                if chosen_bar is None and pm_bars:
+                    # PM extended hours end at 8:00pm ET, so a run that finishes
+                    # after ~7:50pm (e.g. one scheduled to start at 8:15pm) puts
+                    # target_dt past every bar the session will ever have -- no
+                    # later run will find one either. Use the session's last
+                    # published bar instead of leaving this "Pending" forever.
+                    session_close = datetime.combine(entry_date, time(20, 0))
+                    if target_dt >= session_close:
+                        chosen_bar = pm_bars[-1]
+                        session_closed_fallback = True
             elif is_current_run:
                 target_dt = None
                 chosen_bar = None
@@ -2733,16 +2744,23 @@ def build_investment_simulation_rows(
                 entry_price = float(chosen_bar["open"])
                 entry_dt = chosen_bar["datetime"]
                 entry_time = chosen_bar["datetime"].strftime("%I:%M %p ET")
-                data_source = (
-                    "Polygon 1-min PM extended hours"
-                    if target_dt is not None
-                    else "Polygon 1-min PM extended hours (session open)"
-                )
-                if target_dt is None:
+                if session_closed_fallback:
+                    data_source = "Polygon 1-min PM extended hours (session close)"
                     entry_fallback_reason = (
-                        "Good - no run-finish time recorded for this date; used the "
-                        "after-hours session open."
+                        "Good - the report finished after the 8:00pm after-hours "
+                        "close; used the session's last available price."
                     )
+                else:
+                    data_source = (
+                        "Polygon 1-min PM extended hours"
+                        if target_dt is not None
+                        else "Polygon 1-min PM extended hours (session open)"
+                    )
+                    if target_dt is None:
+                        entry_fallback_reason = (
+                            "Good - no run-finish time recorded for this date; used the "
+                            "after-hours session open."
+                        )
             elif is_current_run:
                 when = f"{target_dt:%I:%M %p ET} bar" if target_dt is not None else "entry bar"
                 append_ignored_row(
@@ -4017,6 +4035,9 @@ def main() -> None:
 
     ap.add_argument("--macd_fast", type=int, default=12)
     ap.add_argument("--macd_slow", type=int, default=26)
+    # 12, not the conventional 9 (also the macd() helper's own default) —
+    # deliberate since commit 0777f0b ("signal changed to 12"). Pass
+    # --macd_signal 9 to get the textbook MACD.
     ap.add_argument("--macd_signal", type=int, default=12)
 
     ap.add_argument(

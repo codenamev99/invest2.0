@@ -13,7 +13,9 @@ refreshes price data, screens tickers, simulates trades, and emails a summary.
    - Preferred: `refresh_polygon_daily.py` pulls from the Polygon.io API
      (`POLYGON_API_KEY` env var). Bootstraps full history if `data 2` is
      missing, otherwise does an incremental backfill.
-t.
+   - Fallback: `refresh_stooq_dump.py` copies/moves a manually downloaded
+     Stooq bundle into place (`STOOQ_SRC`, `STOOQ_MODE`); only used when
+     `POLYGON_API_KEY` is unset.
 2. **Rebuild ticker universe**: `generate_tickers.py` pools
    `data 2/daily/us/{nyse stocks,nasdaq stocks}/*.txt` → writes `us_tickers.csv`.
    `--dir` takes one or more folders; a folder that does not exist is skipped
@@ -57,6 +59,16 @@ t.
    reports `Pending` until then, which is fine because the simulation sheets are
    rebuilt from Daily Runs on every run. Rows predating the column fall back to
    the after-hours session open, then to the rank date's close.
+
+   PM extended hours run 4:00-8:00pm ET, and both CI schedules now kick off at
+   8:15pm ET — after that window has already closed for the day. So on the
+   later run that prices a cohort, `Run Finished + 10 min` always lands past
+   the session's last bar; rather than search forever for a bar that will
+   never arrive, this case falls back to the session's **last published bar**
+   (data source "PM extended hours (session close)"). This is what keeps PM
+   entries priced off actual after-hours data instead of silently degrading
+   to the plain daily close on every run — see the `session_closed_fallback`
+   branch in `build_investment_simulation_rows`.
 
    PM Simulation additionally carries a `4M Daily Variance` column (mean of
    `(high - low) / low` over `VARIANCE_LOOKBACK_MONTHS`, as of each row's rank
@@ -123,24 +135,31 @@ screening a different universe:
 
 GitHub Actions reads only `.github/workflows/`, GitLab only `.gitlab-ci.yml`, so
 both files live in the same commit and each host ignores the other's. **Keep the
-code venue-agnostic**: anything venue-specific belongs behind `SCREEN_UNIVERSE`,
-never in a branch that only one remote carries, or the two will drift.
+code, the schedule, and every CI behavior (timeouts, credential checks,
+artifact retention, etc.) identical between the two configs** — `SCREEN_UNIVERSE`
+is the *only* intended difference between them, never a branch that only one
+remote carries, or the two will drift.
 
-`.github/workflows/daily-screener.yml` runs on cron `30 16 * * 1-5` (4:30pm
+`.github/workflows/daily-screener.yml` runs on cron `15 20 * * 1-5` (8:15pm
 America/New_York, weekdays): checkout → Python 3.12 setup → install deps →
 restore `data 2` cache → run `run_daily.sh` → email results → commit the
 updated `results.xlsx` back to the repo as `github-actions[bot]`. The GitLab
-pipeline runs the same steps on a schedule defined in the GitLab UI (its cron
-timezone lives on the schedule, not in the YAML) and keeps `results.xlsx` as a
-build artifact rather than committing it.
+pipeline runs the same steps at the same 8:15pm America/New_York time, on a
+schedule defined in the GitLab UI (Build > Pipeline schedules — its cron
+timezone lives on the schedule, not in the YAML, so **that side of a schedule
+change has to be made by hand in the GitLab UI**), and keeps `results.xlsx` as
+a build artifact rather than committing it.
 
 ## Notes
 
 - `data 2/` and `results.xlsx` are treated as generated/cached state, not
-  hand-edited source — they're rewritten by every daily run and committed by
-  CI. `us_tickers.csv` and `results.csv` are gitignored and regenerated
-  locally — don't add logic that depends on either being fresh in a clean
-  checkout.
+  hand-edited source — they're rewritten by every daily run. `data 2/` is
+  gitignored (`data [0-9]*/`) and is never committed; it only persists between
+  runs via each CI host's own cache (see Automation above). `results.xlsx` is
+  committed back to the repo by the GitHub workflow but kept only as a build
+  artifact by GitLab. `us_tickers.csv` and `results.csv` are gitignored and
+  regenerated locally — don't add logic that depends on either being fresh in
+  a clean checkout.
 - No automated test suite exists. Sanity-check changes to `screen_stooq.py`
   by running `--run_mode single --single_symbol <TICKER>` against existing
   `data 2` before running the full universe.

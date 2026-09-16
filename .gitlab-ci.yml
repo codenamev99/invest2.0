@@ -5,9 +5,19 @@
 # from identical source. This one covers NYSE + NASDAQ; the GitHub workflow pins
 # SCREEN_UNIVERSE to nyse.
 #
-# Required CI/CD variables (Settings > CI/CD > Variables), all masked:
-#   POLYGON_API_KEY, SMTP_HOST, SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD,
-#   EMAIL_FROM, EMAIL_TO
+# Required CI/CD variables (Settings > CI/CD > Variables):
+#   POLYGON_API_KEY, SMTP_HOST, SMTP_USERNAME, SMTP_PASSWORD, EMAIL_TO
+# Optional:
+#   SMTP_PORT (default 587), EMAIL_FROM (defaults to SMTP_USERNAME)
+#
+# Masking notes: GitLab only masks values that are one line, >= 8 characters and
+# drawn from the base64 alphabet plus @ : . ~ + - . So POLYGON_API_KEY,
+# SMTP_PASSWORD and a single-address EMAIL_TO can be masked; SMTP_PORT ("587")
+# is too short, and a comma-separated EMAIL_TO is rejected because commas are
+# not in the allowed set. Leave those two unmasked rather than fighting it.
+#
+# If you mark any of these "Protected", the branch the schedule runs on must
+# also be protected, or the job sees them as empty and fails the checks below.
 
 stages:
   - screen
@@ -15,15 +25,24 @@ stages:
 daily-screener:
   stage: screen
   image: python:3.12
-  # 4:30 PM America/New_York. GitLab schedules carry their own timezone, set on
-  # the schedule itself (Build > Pipeline schedules), not here.
+  # Should run at 8:15 PM America/New_York, in sync with the GitHub workflow's
+  # cron. GitLab schedules carry their own timezone, set on the schedule
+  # itself (Build > Pipeline schedules) rather than here, so that change is
+  # made in the GitLab UI, not in this file.
   rules:
     - if: $CI_PIPELINE_SOURCE == "schedule"
     - if: $CI_PIPELINE_SOURCE == "web"
+  # The first run has an empty cache, so it bootstraps POLYGON_BOOTSTRAP_YEARS
+  # of history for the whole US market before it screens anything. That run is
+  # far longer than a cached one and blows the 60-minute project default.
+  timeout: 3h
   variables:
     SCREEN_UNIVERSE: "us"
     POLYGON_BOOTSTRAP_YEARS: "2"
     POLYGON_BACKFILL_DAYS: "60"
+    # This remote uses a paid Polygon plan, so the bootstrap does not pace
+    # itself. If the key is ever swapped for a free-tier one, set this back to
+    # 13: at 0 the bootstrap retries a 429 three times with no wait, then fails.
     POLYGON_RATE_LIMIT_SLEEP: "0"
     SKIP_PIP_INSTALL: "1"
     EMAIL_SUBJECT_PREFIX: "Daily Screener"
@@ -36,15 +55,33 @@ daily-screener:
       - "data 2/"
   before_script:
     - python -m pip install --quiet -r requirements.txt
+    # Check every credential up front. The screening run costs an hour of
+    # compute, so discovering a missing SMTP variable at the email step means
+    # paying for the whole run and still getting no email.
     - |
-      if [ -z "$POLYGON_API_KEY" ]; then
-        echo "POLYGON_API_KEY CI/CD variable is missing or empty."
+      missing=""
+      for var in POLYGON_API_KEY SMTP_HOST SMTP_USERNAME SMTP_PASSWORD EMAIL_TO; do
+        eval "value=\${$var:-}"
+        if [ -z "$value" ]; then
+          missing="$missing $var"
+        fi
+      done
+      if [ -n "$missing" ]; then
+        echo "Missing CI/CD variable(s):$missing"
+        echo "Add them under Settings > CI/CD > Variables."
+        echo "If they are set but marked Protected, protect the scheduled branch too."
         exit 1
       fi
+    # Says whether the cache came back. An empty count here on a run that is not
+    # the first means the cache did not restore and this run will re-bootstrap.
+    - echo "Cached price files: $(find 'data 2' -name '*.txt' 2>/dev/null | wc -l)"
   script:
     - bash ./run_daily.sh
     - python send_daily_email.py
   artifacts:
     paths:
       - results.xlsx
+    # Keep the workbook even when the email step fails, so a bad SMTP setting
+    # can be diagnosed without re-running the screener.
+    when: always
     expire_in: 30 days

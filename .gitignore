@@ -8,6 +8,7 @@ data/
 data [0-9]*/
 ~$*.xlsx
 *.xlsx.bak
+results_preview.xlsx
 results.csv
 nyse_tickers.csv
 us_tickers.csv

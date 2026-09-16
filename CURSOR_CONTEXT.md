@@ -7,10 +7,10 @@
       "command": "${workspaceFolder}/.venv/bin/python",
       "args": [
         "${workspaceFolder}/refresh_stooq_dump.py",
-        "--zip",
-        "/Users/v/Downloads/data",
+        "--src",
+        "~/Downloads/d_us_txt.zip",
         "--dest",
-        "${workspaceFolder}/data",
+        "${workspaceFolder}/data 2",
         "--mode",
         "copy"
       ],
@@ -33,7 +33,7 @@
         "--tickers",
         "${workspaceFolder}/us_tickers.csv",
         "--root",
-        "${workspaceFolder}/data/daily/us",
+        "${workspaceFolder}/data 2/daily/us",
         "--benchmark",
         "SPY.US",
         "--beta_freq",
@@ -41,7 +41,7 @@
         "--beta_lookback",
         "252",
         "--out",
-        "${workspaceFolder}/results.csv"
+        "${workspaceFolder}/results.xlsx"
       ],
       "options": {
         "cwd": "${workspaceFolder}"
@@ -62,7 +62,7 @@
         "--tickers",
         "${workspaceFolder}/us_tickers.csv",
         "--root",
-        "${workspaceFolder}/data/daily/us",
+        "${workspaceFolder}/data 2/daily/us",
         "--benchmark",
         "SPY.US",
         "--beta_freq",
@@ -70,7 +70,7 @@
         "--beta_months",
         "60",
         "--out",
-        "${workspaceFolder}/results.csv"
+        "${workspaceFolder}/results.xlsx"
       ],
       "options": {
         "cwd": "${workspaceFolder}"
