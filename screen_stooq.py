@@ -4,6 +4,7 @@ import argparse
 import calendar
 import csv
 import io
+import json
 import os
 import subprocess
 import warnings
@@ -2306,6 +2307,34 @@ def evaluate_market_regime(
     return metrics
 
 
+def load_alpaca_state(rank_dates: set[date], state_dir: Path = Path("alpaca_state")) -> dict[tuple[date, str], dict[str, Any]]:
+    """
+    Best-effort read of GitLab's pm-entries job output for PM Simulation's
+    reporting columns.
+
+    pm-entries runs hours before this (see CLAUDE.md's Automation section)
+    and commits alpaca_state/<rank_date>.json separately, since it's a
+    different pipeline with no native artifact link to this one. A rank date
+    with no file (feature not run that day, or that job failed) simply has no
+    entries here -- this must never block PM Simulation from building.
+    """
+    out: dict[tuple[date, str], dict[str, Any]] = {}
+    for rank_date in rank_dates:
+        path = state_dir / f"{rank_date.isoformat()}.json"
+        if not path.exists():
+            continue
+        try:
+            with open(path) as f:
+                rows = json.load(f)
+        except (OSError, ValueError):
+            continue
+        for row in rows:
+            symbol = str(row.get("symbol", "")).strip().upper()
+            if symbol:
+                out[(rank_date, symbol)] = row
+    return out
+
+
 def load_settled_simulation_rows(
     wb: Workbook,
     sheet_name: str,
@@ -2378,6 +2407,30 @@ def load_settled_simulation_rows(
     return out
 
 
+def average_daily_variance(
+    dates_arr: np.ndarray,
+    highs_arr: np.ndarray,
+    lows_arr: np.ndarray,
+    as_of: date,
+) -> float | None:
+    """Mean of (high - low) / low over the lookback window ending at as_of."""
+    if len(dates_arr) == 0:
+        return None
+    start_int = date_to_int(shift_months(as_of, -VARIANCE_LOOKBACK_MONTHS))
+    end_int = date_to_int(as_of)
+    lo_idx = int(np.searchsorted(dates_arr, start_int, side="left"))
+    hi_idx = int(np.searchsorted(dates_arr, end_int, side="right"))
+    if hi_idx <= lo_idx:
+        return None
+    highs_win = np.asarray(highs_arr[lo_idx:hi_idx], dtype=float)
+    lows_win = np.asarray(lows_arr[lo_idx:hi_idx], dtype=float)
+    usable = np.isfinite(highs_win) & np.isfinite(lows_win) & (lows_win > 0)
+    if not usable.any():
+        return None
+    spread = (highs_win[usable] - lows_win[usable]) / lows_win[usable]
+    return float(np.mean(spread))
+
+
 def build_investment_simulation_rows(
     cohorts: list[dict[str, Any]],
     symbol_paths: dict[str, Path],
@@ -2409,29 +2462,6 @@ def build_investment_simulation_rows(
     # branch below for how those rows still get priced same-day once the
     # 8:00pm PM session has closed.
     latest_rank_date = max((c["rank_date"] for c in cohorts), default=None)
-
-    def average_daily_variance(
-        dates_arr: np.ndarray,
-        highs_arr: np.ndarray,
-        lows_arr: np.ndarray,
-        as_of: date,
-    ) -> float | None:
-        """Mean of (high - low) / low over the lookback window ending at as_of."""
-        if len(dates_arr) == 0:
-            return None
-        start_int = date_to_int(shift_months(as_of, -VARIANCE_LOOKBACK_MONTHS))
-        end_int = date_to_int(as_of)
-        lo_idx = int(np.searchsorted(dates_arr, start_int, side="left"))
-        hi_idx = int(np.searchsorted(dates_arr, end_int, side="right"))
-        if hi_idx <= lo_idx:
-            return None
-        highs_win = np.asarray(highs_arr[lo_idx:hi_idx], dtype=float)
-        lows_win = np.asarray(lows_arr[lo_idx:hi_idx], dtype=float)
-        usable = np.isfinite(highs_win) & np.isfinite(lows_win) & (lows_win > 0)
-        if not usable.any():
-            return None
-        spread = (highs_win[usable] - lows_win[usable]) / lows_win[usable]
-        return float(np.mean(spread))
 
     def polygon_ticker(symbol: str) -> str:
         return normalize_symbol(symbol).removesuffix(".US")
@@ -3387,6 +3417,7 @@ def write_summary_only_sheet(
         include_entry_time=True,
         include_market_status=True,
         include_variance=True,
+        alpaca_state=load_alpaca_state({cohort["rank_date"] for cohort in cohorts}),
     )
 
 
@@ -3397,6 +3428,7 @@ def write_summary_sheet(
     include_entry_time: bool = False,
     include_market_status: bool = False,
     include_variance: bool = False,
+    alpaca_state: dict[tuple[date, str], dict[str, Any]] | None = None,
 ) -> None:
     if LEGACY_SUMMARY_SHEET_NAME in wb.sheetnames and SUMMARY_SHEET_NAME not in wb.sheetnames:
         wb[LEGACY_SUMMARY_SHEET_NAME].title = SUMMARY_SHEET_NAME
@@ -3450,6 +3482,9 @@ def write_summary_sheet(
         headers.append(f"{VARIANCE_LOOKBACK_MONTHS}M Daily\nVariance")
     if include_market_status:
         headers.append("SPY - Market Condition")
+    if alpaca_state is not None:
+        headers.append("Alpaca Order ID")
+        headers.append("Alpaca Gate Outcome")
     ws.append(headers)
 
     summary_rows = []
@@ -3491,6 +3526,11 @@ def write_summary_sheet(
             else:
                 condition = row.get("entry_fallback_reason") or "Good"
             output_row.append(condition)
+        if alpaca_state is not None:
+            symbol = str(row.get("symbol") or "").strip().upper()
+            alpaca_row = alpaca_state.get((row.get("rank_date"), symbol)) if row.get("rank_date") else None
+            output_row.append(alpaca_row.get("alpaca_order_id") if alpaca_row else None)
+            output_row.append(alpaca_row.get("gate") if alpaca_row else None)
         summary_rows.append(output_row)
 
     for output_row in summary_rows:
@@ -3511,15 +3551,22 @@ def write_summary_sheet(
     if include_variance:
         last_col += 1
         variance_col = last_col
+    condition_col = None
     if include_market_status:
         last_col += 1
+        condition_col = last_col
+    if alpaca_state is not None:
+        # Trailing, reporting-only columns -- condition_col (used for the
+        # SUMIF below and the highlight styling further down) stays pinned to
+        # the actual "SPY - Market Condition" column regardless of these.
+        last_col += 2
     ws.cell(row=total_label_row, column=result_currency_col, value="TOTAL")
     ws.cell(row=total_label_row, column=result_pct_col, value="TOTAL")
     if summary_rows:
         result_currency_letter = get_column_letter(result_currency_col)
         result_pct_letter = get_column_letter(result_pct_col)
         if include_market_status:
-            condition_letter = get_column_letter(last_col)
+            condition_letter = get_column_letter(condition_col)
             currency_formula = (
                 f'=SUMIF({condition_letter}{data_start_row}:{condition_letter}{data_end_row},"Good*",'
                 f'{result_currency_letter}{data_start_row}:{result_currency_letter}{data_end_row})'
@@ -3650,7 +3697,7 @@ def write_summary_sheet(
             cell.border = summary_border(col_idx, row_idx, include_top=include_top, include_bottom=include_bottom)
 
     if include_market_status:
-        market_condition_col = last_col
+        market_condition_col = condition_col
         ws.column_dimensions[get_column_letter(market_condition_col)].width = 42.0
         red_fill = PatternFill(fill_type="solid", fgColor="F4CCCC")
         red_font = Font(name="Calibri", size=11, bold=True, color="9C0006")
@@ -4087,6 +4134,21 @@ def main() -> None:
         default="",
         help="Ticker to screen when --run_mode single is used, e.g. AAPL or AAPL.US.",
     )
+    ap.add_argument(
+        "--rank_only",
+        action="store_true",
+        help=(
+            "Screen and rank the top_n cohort, write it to --rank_only_out, then "
+            "exit before touching results.xlsx/Daily Runs. For a same-day "
+            "pre-close entry step that needs the ranking but not the full "
+            "simulation rebuild."
+        ),
+    )
+    ap.add_argument(
+        "--rank_only_out",
+        default="top10.json",
+        help="Output path for --rank_only's ranked cohort (default: top10.json).",
+    )
 
     # Average daily dollar volume filter (close * volume)
     ap.add_argument(
@@ -4489,6 +4551,24 @@ def main() -> None:
         for idx, row in enumerate(top10, start=1):
             row["rank"] = idx
         daily_output_rows = scored[: args.daily_limit]
+
+    if args.rank_only:
+        # A same-day, pre-close entry step needs only the ranked cohort, not
+        # the full simulation rebuild -- exit before touching results.xlsx or
+        # Daily Runs so this never collides with the evening run's own write.
+        payload = [
+            {
+                "symbol": row["symbol"],
+                "rank": row["rank"],
+                "rank_date": data_date.isoformat(),
+                "closing_price": row.get("last_close"),
+            }
+            for row in top10
+        ]
+        with open(args.rank_only_out, "w") as f:
+            json.dump(payload, f, indent=2)
+        print(f"Wrote {len(payload)} ranked rows to {args.rank_only_out} (rank_only)")
+        return
 
     if not daily_output_rows:
         daily_output_rows = sorted(
@@ -4945,9 +5025,10 @@ def main() -> None:
     write_commit_summary_sheet(wb)
     prune_old_run_sheets(wb, keep_runs=15)
 
-    # Stamped last so the recorded time is the end of the run. The PM simulation
-    # prices its entries off this, but only on a later run: the bars it needs are
-    # ten minutes in the future at the moment this is written.
+    # Stamped last so the recorded time is the end of the run. PM entries for
+    # older cohorts price off this once it lands; today's own cohort doesn't
+    # need to wait for it -- see the is_current_run handling in
+    # build_investment_simulation_rows.
     finished_at = datetime.now(EASTERN_TZ).replace(tzinfo=None, second=0, microsecond=0)
     stamp_run_finished(wb[DAILY_RUNS_SHEET_NAME], data_date, finished_at)
 

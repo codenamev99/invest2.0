@@ -129,6 +129,9 @@ better than -2%).
   `POLYGON_API_KEY` is unset
 - `SMTP_HOST/PORT/USERNAME/PASSWORD`, `EMAIL_FROM`, `EMAIL_TO`,
   `EMAIL_SUBJECT_PREFIX`, `EMAIL_ATTACH_RESULTS` — for `send_daily_email.py`
+- `ALPACA_API_KEY`, `ALPACA_SECRET_KEY` — Alpaca **paper** trading keys for
+  `alpaca_pm_entries.py`, used only by GitLab's `pm-entries` job (see
+  Automation below); never commit these
 
 ## Automation
 
@@ -143,19 +146,65 @@ screening a different universe:
 GitHub Actions reads only `.github/workflows/`, GitLab only `.gitlab-ci.yml`, so
 both files live in the same commit and each host ignores the other's. **Keep the
 code, the schedule, and every CI behavior (timeouts, credential checks,
-artifact retention, etc.) identical between the two configs** — `SCREEN_UNIVERSE`
-is the *only* intended difference between them, never a branch that only one
-remote carries, or the two will drift.
+artifact retention, etc.) identical between the two configs for the daily
+screening job** — `SCREEN_UNIVERSE` is the only intended difference in that
+job between the two hosts, never a branch that only one remote carries, or
+the two will drift. GitLab's second job, `pm-entries` (below), is a
+deliberate, documented, GitLab-only exception to this rule, not a drift to
+fix.
 
 `.github/workflows/daily-screener.yml` runs on cron `15 20 * * 1-5` (8:15pm
 America/New_York, weekdays): checkout → Python 3.12 setup → install deps →
 restore `data 2` cache → run `run_daily.sh` → email results → commit the
 updated `results.xlsx` back to the repo as `github-actions[bot]`. The GitLab
-pipeline runs the same steps at the same 8:15pm America/New_York time, on a
-schedule defined in the GitLab UI (Build > Pipeline schedules — its cron
-timezone lives on the schedule, not in the YAML, so **that side of a schedule
-change has to be made by hand in the GitLab UI**), and keeps `results.xlsx` as
-a build artifact rather than committing it.
+`daily-screener` job runs the same steps at the same 8:15pm America/New_York
+time, on a schedule defined in the GitLab UI (Build > Pipeline schedules —
+its cron timezone lives on the schedule, not in the YAML, so **that side of a
+schedule change has to be made by hand in the GitLab UI**), and keeps
+`results.xlsx` as a build artifact rather than committing it.
+
+### GitLab-only: `pm-entries`
+
+Alpaca's PM extended-hours window (4:00-8:00pm ET) is the same window the PM
+Simulation fallback described above waits for to *close* before pricing off
+it. That means a real order can't be submitted at 8:15pm — there's no live
+session left. `pm-entries` (`.gitlab-ci.yml`) runs earlier, on its own GitLab
+Pipeline Schedule at 4:15pm America/New_York (15 minutes after the 4:00pm
+regular close, mirroring `daily-screener`'s own post-close buffer), while the
+PM session is still open, and submits real Alpaca **paper** limit orders for
+that day's top-10 cohort. GitLab only — GitLab screens the broader `us`
+universe; GitHub gets no equivalent job.
+
+It does its own lightweight ranking pass rather than reusing
+`daily-screener`'s: `run_pm_entries.sh` does a same-day-only incremental
+Polygon refresh (`--backfill-days 1 --include-today`), then
+`screen_stooq.py --rank_only` screens and ranks but exits before touching
+`results.xlsx` or `Daily Runs` (writing the ranked cohort to `top10.json`
+instead), then `alpaca_pm_entries.py` applies the same regime gate
+(`evaluate_market_regime`) and headroom formula the PM Simulation itself uses
+(using the live quote fetched at submission time as the entry-price proxy,
+since no fill exists yet) and submits a limit order — live quote + $0.05,
+whole shares only, sized off the same $10,000 position size — for every row
+that passes both gates. It writes every row's outcome (submitted, blocked,
+excluded, or skipped, plus the Alpaca order id if submitted) to
+`alpaca_state/<rank_date>.json` and commits that file back to git.
+
+This file is the handoff to the evening job: GitLab's native artifact
+passing (`needs:`) only works within one pipeline, and these are two
+separately-scheduled pipelines, so a git commit is the only durable bridge
+between them. `daily-screener` reads `alpaca_state/<rank_date>.json` back
+(best-effort — the file may be absent) purely to attach reporting columns to
+PM Simulation; it does not feed into `counts_toward_totals` or any other
+gating logic there.
+
+Both jobs live in one `.gitlab-ci.yml`, kept mutually exclusive by a
+`SCHEDULE_KIND` variable set on each job's own GitLab Pipeline Schedule
+(`SCHEDULE_KIND=entries` on the 4:15pm schedule only) — see the file's rules
+for both jobs. A manual "New pipeline" run with no `SCHEDULE_KIND` set still
+runs `daily-screener`, same as before this job existed.
+
+The next-day stop/target exit-order step (mirroring `intraday_exit`'s
+target/stop-first logic against the real Alpaca position) is not yet built.
 
 ## Notes
 
@@ -164,9 +213,12 @@ a build artifact rather than committing it.
   gitignored (`data [0-9]*/`) and is never committed; it only persists between
   runs via each CI host's own cache (see Automation above). `results.xlsx` is
   committed back to the repo by the GitHub workflow but kept only as a build
-  artifact by GitLab. `us_tickers.csv` and `results.csv` are gitignored and
-  regenerated locally — don't add logic that depends on either being fresh in
-  a clean checkout.
+  artifact by GitLab. `us_tickers.csv`, `results.csv`, and `top10.json` are
+  gitignored and regenerated locally — don't add logic that depends on any of
+  them being fresh in a clean checkout. `alpaca_state/*.json` is the one
+  exception: it *is* committed (by GitLab's `pm-entries` job only — see
+  Automation), since it's the durable handoff between two separately
+  scheduled pipelines, not throwaway intermediate output.
 - No automated test suite exists. Sanity-check changes to `screen_stooq.py`
   by running `--run_mode single --single_symbol <TICKER>` against existing
   `data 2` before running the full universe.
