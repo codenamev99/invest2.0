@@ -74,7 +74,8 @@ daily-screener:
       fi
     # Says whether the cache came back. An empty count here on a run that is not
     # the first means the cache did not restore and this run will re-bootstrap.
-    - echo "Cached price files: $(find 'data 2' -name '*.txt' 2>/dev/null | wc -l)"
+    - |
+      echo "Cached price files: $(find 'data 2' -name '*.txt' 2>/dev/null | wc -l)"
   script:
     - bash ./run_daily.sh
     - python send_daily_email.py
