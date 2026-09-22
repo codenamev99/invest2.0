@@ -26,10 +26,25 @@
 # Two jobs, one GitLab-UI-configured schedule each (see CLAUDE.md's
 # Automation section): daily-screener at 8:15pm ET (unchanged) and
 # pm-entries at 4:15pm ET (new, GitLab-only -- see CLAUDE.md for why this
-# doesn't also exist on GitHub). Each GitLab Pipeline Schedule sets its own
-# SCHEDULE_KIND variable so the two rules below never both match the same
-# pipeline; a manual "New pipeline" run with no SCHEDULE_KIND set still runs
-# daily-screener, unchanged from before this job existed.
+# doesn't also exist on GitHub). Each schedule sets the schedule_kind input
+# below (Build > Pipeline schedules > Edit > Inputs -- this GitLab version
+# replaced the older per-schedule "Variables" list with typed Inputs) so the
+# two rules further down never both match the same pipeline; a manual "New
+# pipeline" run with no input set still runs daily-screener, unchanged from
+# before this job existed.
+spec:
+  inputs:
+    schedule_kind:
+      default: ""
+      description: >-
+        Set to "entries" only on the pm-entries GitLab Pipeline Schedule's
+        own Inputs section, at 4:15pm ET. Left at its default everywhere
+        else, including the 8:15pm daily-screener schedule and any manual
+        "New pipeline" run.
+---
+
+variables:
+  SCHEDULE_KIND: $[[ inputs.schedule_kind ]]
 
 stages:
   - entries

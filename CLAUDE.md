@@ -198,10 +198,13 @@ PM Simulation; it does not feed into `counts_toward_totals` or any other
 gating logic there.
 
 Both jobs live in one `.gitlab-ci.yml`, kept mutually exclusive by a
-`SCHEDULE_KIND` variable set on each job's own GitLab Pipeline Schedule
-(`SCHEDULE_KIND=entries` on the 4:15pm schedule only) — see the file's rules
-for both jobs. A manual "New pipeline" run with no `SCHEDULE_KIND` set still
-runs `daily-screener`, same as before this job existed.
+`schedule_kind` pipeline **input** (`spec: inputs:` at the top of the file,
+mapped to a `SCHEDULE_KIND` variable the job `rules:` read) set on each
+schedule's own Inputs section (Build > Pipeline schedules > Edit > Inputs —
+this GitLab version replaced the older per-schedule "Variables" list with
+typed Inputs): `schedule_kind: entries` on the 4:15pm schedule only. A manual
+"New pipeline" run, or the 8:15pm schedule which leaves the input at its
+default, still runs `daily-screener`, same as before this job existed.
 
 The next-day stop/target exit-order step (mirroring `intraday_exit`'s
 target/stop-first logic against the real Alpaca position) is not yet built.
