@@ -95,7 +95,7 @@ jobs:
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
-          EMAIL_SUBJECT_PREFIX: ${{ vars.EMAIL_SUBJECT_PREFIX || 'Daily Screener' }}
+          EMAIL_SUBJECT_PREFIX: ${{ vars.EMAIL_SUBJECT_PREFIX || 'NYSE' }}
           EMAIL_ATTACH_RESULTS: ${{ vars.EMAIL_ATTACH_RESULTS || 'true' }}
         run: python send_daily_email.py
 

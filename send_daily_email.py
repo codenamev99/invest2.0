@@ -353,7 +353,7 @@ def build_email_html() -> tuple[str, str]:
     ranked_title, ranked_html = ranked_stocks_table(wb)
     simulation_totals = simulation_totals_html(wb)
     ipo_html = upcoming_ipos_table(wb)
-    run_date = datetime.now().strftime("%b %-d, %Y")
+    run_date = datetime.now().strftime("%b %-d, %Y").upper()
     subject_prefix = os.environ.get("EMAIL_SUBJECT_PREFIX", "Daily Screener").strip() or "Daily Screener"
     subject = f"{subject_prefix} - {run_date}"
 

@@ -45,7 +45,7 @@ daily-screener:
     # 13: at 0 the bootstrap retries a 429 three times with no wait, then fails.
     POLYGON_RATE_LIMIT_SLEEP: "0"
     SKIP_PIP_INSTALL: "1"
-    EMAIL_SUBJECT_PREFIX: "Daily Screener"
+    EMAIL_SUBJECT_PREFIX: "NASDAQ+NYSE"
     EMAIL_ATTACH_RESULTS: "true"
   cache:
     # Price history is large and regenerable; keeping it across runs is what
