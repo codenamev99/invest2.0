@@ -54,21 +54,28 @@ refreshes price data, screens tickers, simulates trades, and emails a summary.
    Daily Runs' last column, `Run Finished`, is stamped by `stamp_run_finished`
    immediately before `wb.save` so it records the end of the run. `pm` entries
    price off it: the fill is the first minute bar at or after that time plus
-   `PM_ENTRY_DELAY_MINUTES` (10). The bar is ten minutes in the future when the
-   stamp is written, so **a day's PM row is only priced on a later run** — it
-   reports `Pending` until then, which is fine because the simulation sheets are
-   rebuilt from Daily Runs on every run. Rows predating the column fall back to
-   the after-hours session open, then to the rank date's close.
+   `PM_ENTRY_DELAY_MINUTES` (10). Rows predating the column fall back to the
+   after-hours session open, then to the rank date's close.
 
    PM extended hours run 4:00-8:00pm ET, and both CI schedules now kick off at
-   8:15pm ET — after that window has already closed for the day. So on the
-   later run that prices a cohort, `Run Finished + 10 min` always lands past
-   the session's last bar; rather than search forever for a bar that will
-   never arrive, this case falls back to the session's **last published bar**
-   (data source "PM extended hours (session close)"). This is what keeps PM
-   entries priced off actual after-hours data instead of silently degrading
-   to the plain daily close on every run — see the `session_closed_fallback`
-   branch in `build_investment_simulation_rows`.
+   8:15pm ET — after that window has already closed for the day. So once
+   `Run Finished` is stamped, `Run Finished + 10 min` always lands past the
+   session's last bar; rather than search forever for a bar that will never
+   arrive, this case falls back to the session's **last published bar** (data
+   source "PM extended hours (session close)") — see the
+   `session_closed_fallback` branch in `build_investment_simulation_rows`.
+
+   A cohort's own run hasn't stamped `Run Finished` yet when that cohort is
+   built (the stamp happens later, right before save), so there's no
+   `Run Finished + 10 min` target to search for on day one. But the run is
+   already executing after 8:15pm ET, i.e. after the session closed, so the
+   **same** last-published-bar fallback applies immediately, gated on wall
+   clock (`datetime.now(EASTERN_TZ)`) rather than the not-yet-stamped
+   timestamp — a same-day cohort is priced same-day, not deferred to
+   tomorrow's run. It only falls through to `Pending` if the run executes
+   before 8pm ET (e.g. a manual `workflow_dispatch`/`web` trigger) or Polygon
+   hasn't published any PM bars for the symbol yet, in which case the
+   simulation sheets rebuild from Daily Runs on the next run and pick it up.
 
    PM Simulation additionally carries a `4M Daily Variance` column (mean of
    `(high - low) / low` over `VARIANCE_LOOKBACK_MONTHS`, as of each row's rank

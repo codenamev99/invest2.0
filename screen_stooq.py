@@ -2404,8 +2404,10 @@ def build_investment_simulation_rows(
     market_series = _market_symbol_series(MARKET_REGIME_SPY, symbol_paths, root, ohlc_cache)
     market_dates = market_series[0] if market_series is not None else np.array([], dtype=np.int32)
     run_finish_times = run_finish_times or {}
-    # The newest cohort is the run that just happened, so its PM entry bars do
-    # not exist yet; those rows are held pending instead of priced.
+    # The newest cohort is the run that just happened, so it has no stamped
+    # Run Finished time yet -- see the is_current_run handling in the "pm"
+    # branch below for how those rows still get priced same-day once the
+    # 8:00pm PM session has closed.
     latest_rank_date = max((c["rank_date"] for c in cohorts), default=None)
 
     def average_daily_variance(
@@ -2706,9 +2708,12 @@ def build_investment_simulation_rows(
             )
             finished_at = run_finish_times.get(rank_date)
             # The newest cohort belongs to the run happening right now, which has
-            # not stamped its finish time yet. Its bars from earlier in the session
-            # do exist, but they are not the entry -- so it must not fall back to
-            # them, or every run would book a placeholder into its own totals.
+            # not stamped its finish time yet, so there is no Run Finished + 10min
+            # target to search for. But both CI schedules start at 8:15pm ET,
+            # after the 4:00-8:00pm PM session has already closed, so as long as
+            # it is already past that close *right now*, the session's last
+            # published bar is already final and safe to use without waiting for
+            # tomorrow's run to stamp a finish time and resolve it.
             is_current_run = rank_date == latest_rank_date
             session_closed_fallback = False
             if finished_at is not None:
@@ -2734,6 +2739,12 @@ def build_investment_simulation_rows(
             elif is_current_run:
                 target_dt = None
                 chosen_bar = None
+                if pm_bars:
+                    session_close = datetime.combine(entry_date, time(20, 0))
+                    now_et = datetime.now(EASTERN_TZ).replace(tzinfo=None)
+                    if now_et >= session_close:
+                        chosen_bar = pm_bars[-1]
+                        session_closed_fallback = True
             else:
                 # Runs predating the Run Finished column have no time to offset
                 # from, so the entry falls back to the open of the session.
@@ -2746,10 +2757,16 @@ def build_investment_simulation_rows(
                 entry_time = chosen_bar["datetime"].strftime("%I:%M %p ET")
                 if session_closed_fallback:
                     data_source = "Polygon 1-min PM extended hours (session close)"
-                    entry_fallback_reason = (
-                        "Good - the report finished after the 8:00pm after-hours "
-                        "close; used the session's last available price."
-                    )
+                    if is_current_run:
+                        entry_fallback_reason = (
+                            "Good - this run is already past the 8:00pm after-hours "
+                            "close; used the session's last available price."
+                        )
+                    else:
+                        entry_fallback_reason = (
+                            "Good - the report finished after the 8:00pm after-hours "
+                            "close; used the session's last available price."
+                        )
                 else:
                     data_source = (
                         "Polygon 1-min PM extended hours"
