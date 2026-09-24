@@ -37,10 +37,10 @@ spec:
     schedule_kind:
       default: ""
       description: >-
-        Set to "entries" only on the pm-entries GitLab Pipeline Schedule's
-        own Inputs section, at 4:15pm ET. Left at its default everywhere
-        else, including the 8:15pm daily-screener schedule and any manual
-        "New pipeline" run.
+        "entries" on the pm-entries schedule (4:15pm ET), "exits" on the
+        pm-exits schedule (9:35am ET) -- set in each schedule's own Inputs
+        section. Left at its default everywhere else, including the 8:15pm
+        daily-screener schedule and any manual "New pipeline" run.
 ---
 
 variables:
@@ -58,8 +58,8 @@ daily-screener:
   # itself (Build > Pipeline schedules) rather than here, so that change is
   # made in the GitLab UI, not in this file.
   rules:
-    - if: '$CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_KIND != "entries"'
-    - if: '$CI_PIPELINE_SOURCE == "web" && $SCHEDULE_KIND != "entries"'
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_KIND != "entries" && $SCHEDULE_KIND != "exits"'
+    - if: '$CI_PIPELINE_SOURCE == "web" && $SCHEDULE_KIND != "entries" && $SCHEDULE_KIND != "exits"'
   # The first run has an empty cache, so it bootstraps POLYGON_BOOTSTRAP_YEARS
   # of history for the whole US market before it screens anything. That run is
   # far longer than a cached one and blows the 60-minute project default.
@@ -169,6 +169,61 @@ pm-entries:
   artifacts:
     paths:
       - top10.json
+      - alpaca_state/
+    when: always
+    expire_in: 30 days
+
+pm-exits:
+  stage: entries
+  image: python:3.12
+  # Should run at 9:35 AM America/New_York -- 5 minutes after the regular
+  # open, because Alpaca rejects OCO/stop orders during extended hours, so
+  # the exit for an entry that filled the previous evening can only be
+  # placed once regular hours are open. Set on its own GitLab Pipeline
+  # Schedule with the schedule_kind input set to "exits".
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $SCHEDULE_KIND == "exits"'
+    - if: '$CI_PIPELINE_SOURCE == "web" && $SCHEDULE_KIND == "exits"'
+  timeout: 30m
+  variables:
+    SKIP_PIP_INSTALL: "1"
+  cache:
+    # Only read here -- trading-day counting for the 5-day timeout reads the
+    # daily bars this cache already holds. No Polygon refresh in this job.
+    key: polygon-data
+    paths:
+      - "data 2/"
+    policy: pull
+  before_script:
+    - python -m pip install --quiet -r requirements.txt
+    - |
+      missing=""
+      for var in ALPACA_API_KEY ALPACA_SECRET_KEY; do
+        eval "value=\${$var:-}"
+        if [ -z "$value" ]; then
+          missing="$missing $var"
+        fi
+      done
+      if [ -n "$missing" ]; then
+        echo "Missing CI/CD variable(s):$missing"
+        echo "Add them under Settings > CI/CD > Variables."
+        echo "If they are set but marked Protected, protect the scheduled branch too."
+        exit 1
+      fi
+  script:
+    - bash ./run_pm_exits.sh
+    - |
+      git config user.name "gitlab-ci-bot"
+      git config user.email "gitlab-ci-bot@users.noreply.gitlab.com"
+      git add "alpaca_state/"
+      if git diff --cached --quiet; then
+        echo "No Alpaca exit state to commit."
+      else
+        git commit -m "Record Alpaca PM exit orders"
+        git push origin "HEAD:${CI_COMMIT_REF_NAME}"
+      fi
+  artifacts:
+    paths:
       - alpaca_state/
     when: always
     expire_in: 30 days

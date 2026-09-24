@@ -22,6 +22,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
+from alpaca.common.exceptions import APIError
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestTradeRequest
 from alpaca.trading.client import TradingClient
@@ -78,6 +79,21 @@ def main() -> None:
         else Path("alpaca_state") / f"{rank_date.isoformat()}.json"
     )
     state_out.parent.mkdir(parents=True, exist_ok=True)
+
+    # A re-run must not clobber exit-tracking fields alpaca_pm_exits.py may
+    # have already added to this same day's file (normally impossible --
+    # exits only ever runs the morning after entries -- but cheap insurance
+    # against a manual re-trigger).
+    existing_by_symbol: dict[str, dict[str, Any]] = {}
+    if state_out.exists():
+        try:
+            with open(state_out) as f:
+                for prior_row in json.load(f):
+                    sym = str(prior_row.get("symbol", "")).strip().upper()
+                    if sym:
+                        existing_by_symbol[sym] = prior_row
+        except (OSError, ValueError):
+            pass
 
     results: list[dict[str, Any]] = []
     for row in top10:
@@ -165,8 +181,30 @@ def main() -> None:
             outcome["gate"] = "submitted"
             outcome["alpaca_order_id"] = str(order.id)
             outcome["submitted_at"] = datetime.now(s.EASTERN_TZ).isoformat()
-        except Exception as exc:
-            outcome["gate"] = f"error: {exc}"
+        except APIError as exc:
+            # A retried/duplicate run hits Alpaca's own client_order_id
+            # uniqueness check -- that's the idempotency guard working, not a
+            # failure. Look the original order back up so the state file
+            # still reflects "submitted" with its real id, instead of
+            # clobbering a prior successful submission with an error row
+            # that alpaca_pm_exits.py would then never pick up.
+            if "client_order_id must be unique" in str(exc):
+                try:
+                    existing = trading.get_order_by_client_id(order_req.client_order_id)
+                    outcome["gate"] = "submitted"
+                    outcome["alpaca_order_id"] = str(existing.id)
+                    outcome["submitted_at"] = (
+                        existing.submitted_at or datetime.now(s.EASTERN_TZ)
+                    ).isoformat()
+                except Exception as lookup_exc:
+                    outcome["gate"] = f"error: duplicate order, lookup failed ({lookup_exc})"
+            else:
+                outcome["gate"] = f"error: {exc}"
+        prior_row = existing_by_symbol.get(symbol)
+        if prior_row:
+            for key, value in prior_row.items():
+                if key not in outcome:
+                    outcome[key] = value
         results.append(outcome)
 
     with open(state_out, "w") as f:

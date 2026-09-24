@@ -3485,6 +3485,8 @@ def write_summary_sheet(
     if alpaca_state is not None:
         headers.append("Alpaca Order ID")
         headers.append("Alpaca Gate Outcome")
+        headers.append("Alpaca Exit Status")
+        headers.append("Alpaca Exit Price")
     ws.append(headers)
 
     summary_rows = []
@@ -3531,6 +3533,8 @@ def write_summary_sheet(
             alpaca_row = alpaca_state.get((row.get("rank_date"), symbol)) if row.get("rank_date") else None
             output_row.append(alpaca_row.get("alpaca_order_id") if alpaca_row else None)
             output_row.append(alpaca_row.get("gate") if alpaca_row else None)
+            output_row.append(alpaca_row.get("exit_status") if alpaca_row else None)
+            output_row.append(alpaca_row.get("exit_price") if alpaca_row else None)
         summary_rows.append(output_row)
 
     for output_row in summary_rows:
@@ -3559,7 +3563,7 @@ def write_summary_sheet(
         # Trailing, reporting-only columns -- condition_col (used for the
         # SUMIF below and the highlight styling further down) stays pinned to
         # the actual "SPY - Market Condition" column regardless of these.
-        last_col += 2
+        last_col += 4
     ws.cell(row=total_label_row, column=result_currency_col, value="TOTAL")
     ws.cell(row=total_label_row, column=result_pct_col, value="TOTAL")
     if summary_rows:

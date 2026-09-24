@@ -130,8 +130,8 @@ better than -2%).
 - `SMTP_HOST/PORT/USERNAME/PASSWORD`, `EMAIL_FROM`, `EMAIL_TO`,
   `EMAIL_SUBJECT_PREFIX`, `EMAIL_ATTACH_RESULTS` — for `send_daily_email.py`
 - `ALPACA_API_KEY`, `ALPACA_SECRET_KEY` — Alpaca **paper** trading keys for
-  `alpaca_pm_entries.py`, used only by GitLab's `pm-entries` job (see
-  Automation below); never commit these
+  `alpaca_pm_entries.py` / `alpaca_pm_exits.py`, used only by GitLab's
+  `pm-entries` and `pm-exits` jobs (see Automation below); never commit these
 
 ## Automation
 
@@ -149,8 +149,8 @@ code, the schedule, and every CI behavior (timeouts, credential checks,
 artifact retention, etc.) identical between the two configs for the daily
 screening job** — `SCREEN_UNIVERSE` is the only intended difference in that
 job between the two hosts, never a branch that only one remote carries, or
-the two will drift. GitLab's second job, `pm-entries` (below), is a
-deliberate, documented, GitLab-only exception to this rule, not a drift to
+the two will drift. GitLab's extra jobs, `pm-entries` and `pm-exits` (below),
+are deliberate, documented, GitLab-only exceptions to this rule, not drift to
 fix.
 
 `.github/workflows/daily-screener.yml` runs on cron `15 20 * * 1-5` (8:15pm
@@ -197,17 +197,47 @@ between them. `daily-screener` reads `alpaca_state/<rank_date>.json` back
 PM Simulation; it does not feed into `counts_toward_totals` or any other
 gating logic there.
 
-Both jobs live in one `.gitlab-ci.yml`, kept mutually exclusive by a
+All three jobs live in one `.gitlab-ci.yml`, kept mutually exclusive by a
 `schedule_kind` pipeline **input** (`spec: inputs:` at the top of the file,
 mapped to a `SCHEDULE_KIND` variable the job `rules:` read) set on each
 schedule's own Inputs section (Build > Pipeline schedules > Edit > Inputs —
 this GitLab version replaced the older per-schedule "Variables" list with
-typed Inputs): `schedule_kind: entries` on the 4:15pm schedule only. A manual
-"New pipeline" run, or the 8:15pm schedule which leaves the input at its
-default, still runs `daily-screener`, same as before this job existed.
+typed Inputs): `schedule_kind: entries` on the 4:15pm schedule, `exits` on
+the 9:35am one. A manual "New pipeline" run, or the 8:15pm schedule which
+leaves the input at its default, still runs `daily-screener`, same as before
+these jobs existed.
 
-The next-day stop/target exit-order step (mirroring `intraday_exit`'s
-target/stop-first logic against the real Alpaca position) is not yet built.
+### GitLab-only: `pm-exits`
+
+`pm-entries` only opens positions. `pm-exits` (`.gitlab-ci.yml`,
+`run_pm_exits.sh` → `alpaca_pm_exits.py`) manages them, on its own schedule
+at **9:35am America/New_York** — 5 minutes after the regular open, because
+Alpaca rejects OCO/stop orders during extended hours, so an entry that filled
+the previous evening can only get its exit placed the next morning.
+
+Each run scans a rolling ~10-day window of `alpaca_state/*.json` (not just
+yesterday, so a skipped or failed run self-heals) and, per row, skips
+anything already terminal, then:
+
+- entry order never filled (`canceled`/`expired`/`rejected`) → `entry_unfilled`
+- entry filled, no exit yet → submit an **OCO sell** off the *real*
+  `filled_avg_price` (not the submitted limit): take-profit at +2%, stop-loss
+  at -1%, GTC, sized to the real `filled_qty` → `oco_open`
+- `oco_open` → resolve it. The order this job tracks *is* the take-profit
+  leg, so a target hit shows as that order `FILLED`; a stop hit instead shows
+  as that order `CANCELED` with its sibling leg (`order.legs`) filled — both
+  cases are handled, see `resolve_oco`
+- still unresolved past the same `follow_days` (5) trading-day window the
+  simulation uses → cancel the OCO, then `close_position`. **Known
+  approximation**: that closes at whatever the market prints when the job
+  runs, not literally day 5's close the way the retrospective simulation can
+  compute after the fact.
+
+Trading-day counting reuses the same local daily-bar array the simulation
+does (`load_ohlc_from_file` + `date_to_int`/searchsorted), so both count days
+the same way; it returns `None` and safely skips the timeout check when that
+symbol's bars don't cover the range yet. This job needs no Polygon refresh —
+its cache block is `policy: pull` since it only reads `data 2/`.
 
 ## Notes
 
@@ -219,9 +249,11 @@ target/stop-first logic against the real Alpaca position) is not yet built.
   artifact by GitLab. `us_tickers.csv`, `results.csv`, and `top10.json` are
   gitignored and regenerated locally — don't add logic that depends on any of
   them being fresh in a clean checkout. `alpaca_state/*.json` is the one
-  exception: it *is* committed (by GitLab's `pm-entries` job only — see
-  Automation), since it's the durable handoff between two separately
-  scheduled pipelines, not throwaway intermediate output.
+  exception: it *is* committed (by GitLab's `pm-entries` and `pm-exits` jobs
+  — see Automation), since it's the durable handoff between separately
+  scheduled pipelines, not throwaway intermediate output. `pm-entries`
+  rewrites the day's file wholesale, so it deliberately carries forward any
+  exit fields `pm-exits` already wrote for those rows.
 - No automated test suite exists. Sanity-check changes to `screen_stooq.py`
   by running `--run_mode single --single_symbol <TICKER>` against existing
   `data 2` before running the full universe.
