@@ -2369,6 +2369,7 @@ def load_settled_simulation_rows(
         "symbol", "rank date", "entry date", "entry price", "entry time",
         "exit date", "exit time", "exit price", "result $", "result %",
         f"{VARIANCE_LOOKBACK_MONTHS}m daily variance", "spy - market condition",
+        "exit reason",
     )}
     if idx["symbol"] is None or idx["rank date"] is None or idx["exit date"] is None:
         return {}
@@ -2399,6 +2400,9 @@ def load_settled_simulation_rows(
                 get(row, f"{VARIANCE_LOOKBACK_MONTHS}m daily variance")
             ),
             "cached_condition": get(row, "spy - market condition"),
+            # Round-trips so the ambiguity measurement accumulates across runs
+            # instead of being blanked every time a row is reused.
+            "exit_reason": get(row, "exit reason") or "",
             # Only used when the sheet carries no condition column.
             "status": "Closed",
             "market_reason": "",
@@ -3482,6 +3486,10 @@ def write_summary_sheet(
         headers.append(f"{VARIANCE_LOOKBACK_MONTHS}M Daily\nVariance")
     if include_market_status:
         headers.append("SPY - Market Condition")
+    # Diagnostic: "+2% target" / "-1% stop" / "Max 5 trading days", plus the
+    # "Both hit same minute/day - assumed -1% first" cases, which are the ones
+    # 1-minute bars can't disambiguate. Kept out of the SUMIF range below.
+    headers.append("Exit Reason")
     if alpaca_state is not None:
         headers.append("Alpaca Order ID")
         headers.append("Alpaca Gate Outcome")
@@ -3528,6 +3536,7 @@ def write_summary_sheet(
             else:
                 condition = row.get("entry_fallback_reason") or "Good"
             output_row.append(condition)
+        output_row.append(row.get("exit_reason") or None)
         if alpaca_state is not None:
             symbol = str(row.get("symbol") or "").strip().upper()
             alpaca_row = alpaca_state.get((row.get("rank_date"), symbol)) if row.get("rank_date") else None
@@ -3559,6 +3568,9 @@ def write_summary_sheet(
     if include_market_status:
         last_col += 1
         condition_col = last_col
+    # Exit Reason sits after the condition column, so condition_col (and the
+    # SUMIF range built from it) is unaffected.
+    last_col += 1
     if alpaca_state is not None:
         # Trailing, reporting-only columns -- condition_col (used for the
         # SUMIF below and the highlight styling further down) stays pinned to
