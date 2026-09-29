@@ -9,12 +9,28 @@ from collections import Counter, OrderedDict
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 warnings.filterwarnings(
     "ignore",
     message=r"urllib3 v2 only supports OpenSSL 1\.1\.1\+.*",
 )
 import requests
+
+
+EASTERN_TZ = ZoneInfo("America/New_York")
+
+
+def market_today() -> date:
+    """
+    Today on the *market* calendar, not the runner's clock.
+
+    CI runners are UTC, so anything scheduled after 8:00pm ET is already
+    tomorrow by `date.today()`. Asking Polygon for that date requests a
+    session that has not happened yet, which it answers with
+    403 "Attempted to request today's data before end of day".
+    """
+    return datetime.now(EASTERN_TZ).date()
 
 
 GROUPED_DAILY_URL = "https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{date}"
@@ -210,18 +226,28 @@ def build_file_map(root: Path) -> dict[str, Path]:
 
 def candidate_dates(lookback_days: int, include_today: bool = False) -> list[date]:
     # Morning/default runs avoid today's incomplete bar; post-close runs may opt in.
-    start = date.today() if include_today else date.today() - timedelta(days=1)
+    start = market_today() if include_today else market_today() - timedelta(days=1)
     return [start - timedelta(days=i) for i in range(max(1, lookback_days))]
 
 
 def backfill_candidate_dates(backfill_days: int, include_today: bool = False) -> list[date]:
-    end = date.today() if include_today else date.today() - timedelta(days=1)
+    end = market_today() if include_today else market_today() - timedelta(days=1)
     start = end - timedelta(days=max(1, backfill_days) - 1)
     return [
         start + timedelta(days=i)
         for i in range((end - start).days + 1)
         if (start + timedelta(days=i)).weekday() < 5
     ]
+
+
+class SessionNotFinished(RuntimeError):
+    """
+    Polygon refused a date because that session has not ended yet.
+
+    Distinct from a real auth failure even though both arrive as 403: the key
+    is fine, the day simply isn't available. Callers skip the date instead of
+    aborting, so one unavailable day can't take down a whole backfill.
+    """
 
 
 def fetch_grouped_daily(
@@ -242,6 +268,11 @@ def fetch_grouped_daily(
     if resp.status_code == 429:
         raise RuntimeError("Polygon rate limit hit. Try again later or use a paid plan.")
     if resp.status_code in {401, 403}:
+        body = resp.text or ""
+        if "before end of day" in body.lower():
+            raise SessionNotFinished(
+                f"Polygon has no data for {trading_date.isoformat()} yet (session not finished)."
+            )
         raise RuntimeError("Polygon rejected the API key or this endpoint is not enabled for the plan.")
     resp.raise_for_status()
 
@@ -265,7 +296,7 @@ def ensure_benchmark_history(
     """Repair SPY/QQQ history with two targeted Polygon aggregate requests."""
     if calendar_days <= 0:
         return
-    end = date.today() if include_today else date.today() - timedelta(days=1)
+    end = market_today() if include_today else market_today() - timedelta(days=1)
     start = end - timedelta(days=calendar_days - 1)
     symbol_paths = build_file_map(root)
 
@@ -387,7 +418,7 @@ def fetch_reference_symbols(
 
 
 def bootstrap_date_range(args: argparse.Namespace) -> list[date]:
-    default_end = date.today() if args.include_today else date.today() - timedelta(days=1)
+    default_end = market_today() if args.include_today else market_today() - timedelta(days=1)
     end = parse_yyyy_mm_dd(args.bootstrap_end) if args.bootstrap_end else default_end
     if args.bootstrap_start:
         start = parse_yyyy_mm_dd(args.bootstrap_start)
@@ -497,13 +528,17 @@ def bootstrap_history(args: argparse.Namespace, root: Path, api_key: str) -> Non
     counts = {"days_with_data": 0, "rows_written": 0, "skipped": 0}
     with AppendFileCache(dry_run=args.dry_run) as files:
         for idx, trading_date in enumerate(dates, start=1):
-            bars = fetch_grouped_daily_with_retries(
-                api_key,
-                trading_date,
-                adjusted=not args.unadjusted,
-                include_otc=args.include_otc,
-                rate_limit_sleep=args.rate_limit_sleep,
-            )
+            try:
+                bars = fetch_grouped_daily_with_retries(
+                    api_key,
+                    trading_date,
+                    adjusted=not args.unadjusted,
+                    include_otc=args.include_otc,
+                    rate_limit_sleep=args.rate_limit_sleep,
+                )
+            except SessionNotFinished as exc:
+                print(f"[{idx}/{len(dates)}] {exc}")
+                continue
             if bars:
                 counts["days_with_data"] += 1
             for bar in bars:
@@ -548,6 +583,10 @@ def find_latest_grouped_data(
     for d in candidate_dates(lookback_days, include_today=include_today):
         try:
             rows = fetch_grouped_daily(api_key, d, adjusted, include_otc)
+        except SessionNotFinished:
+            # Walking backwards to find the newest day that has data, so a
+            # session that hasn't ended yet is just the next candidate.
+            continue
         except RuntimeError:
             raise
         except requests.RequestException as e:
@@ -759,13 +798,18 @@ def backfill_recent_days(args: argparse.Namespace, root: Path, new_symbols_dir: 
     # read and rewritten once for the whole window rather than once per day.
     pending: dict[Path, dict[int, str]] = {}
     for idx, trading_date in enumerate(dates, start=1):
-        bars = fetch_grouped_daily_with_retries(
-            api_key,
-            trading_date,
-            adjusted=not args.unadjusted,
-            include_otc=args.include_otc,
-            rate_limit_sleep=args.rate_limit_sleep,
-        )
+        try:
+            bars = fetch_grouped_daily_with_retries(
+                api_key,
+                trading_date,
+                adjusted=not args.unadjusted,
+                include_otc=args.include_otc,
+                rate_limit_sleep=args.rate_limit_sleep,
+            )
+        except SessionNotFinished as exc:
+            total["no_data"] += 1
+            print(f"[{idx}/{len(dates)}] {trading_date.isoformat()}: {exc}")
+            continue
         if not bars:
             total["no_data"] += 1
             print(f"[{idx}/{len(dates)}] {trading_date.isoformat()}: no data")
